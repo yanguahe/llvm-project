@@ -425,6 +425,17 @@ def ROCDL_mfma_f32_16x16x4bf16_1k : ROCDL_Mfma_IntrOp<"mfma.f32.16x16x4bf16.1k">
 def ROCDL_mfma_f32_4x4x4bf16_1k : ROCDL_Mfma_IntrOp<"mfma.f32.4x4x4bf16.1k">;
 def ROCDL_mfma_f32_32x32x8bf16_1k : ROCDL_Mfma_IntrOp<"mfma.f32.32x32x8bf16.1k">;
 def ROCDL_mfma_f32_16x16x16bf16_1k : ROCDL_Mfma_IntrOp<"mfma.f32.16x16x16bf16.1k">;
+// Explicit register class control: force D/C to VGPR (ACC_CD=0).
+def ROCDL_mfma_f32_16x16x16bf16_1k_vcd : ROCDL_Mfma_IntrOp<"mfma.f32.16x16x16bf16.1k.vcd">;
+// Force value into AccVGPR register class (identity function).
+def ROCDL_to_agpr_v4i32 : ROCDL_IntrOp<"to.agpr.v4i32", [], [], [], 1>,
+  Arguments<(ins LLVM_Type:$src)> {
+  let assemblyFormat = "$src attr-dict `:` functional-type($src, $res)";
+}
+def ROCDL_to_agpr_v4i16 : ROCDL_IntrOp<"to.agpr.v4i16", [], [], [], 1>,
+  Arguments<(ins LLVM_Type:$src)> {
+  let assemblyFormat = "$src attr-dict `:` functional-type($src, $res)";
+}
 // Note: in gfx94x, unlike in gfx90a, the f64 xdlops use the "blgp" argument as
 // a NEG bitfield. See IntrinsicsAMDGPU.td for more info.
 def ROCDL_mfma_f64_16x16x4f64 : ROCDL_Mfma_IntrOp<"mfma.f64.16x16x4f64">;

@@ -29,7 +29,10 @@
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
+#include "llvm/Target/TargetOptions.h"
 #include "llvm/Transforms/IPO/Internalize.h"
+
+#include <cstdlib>
 
 using namespace mlir;
 using namespace mlir::LLVM;
@@ -64,9 +67,17 @@ ModuleToObject::getOrCreateTargetMachine() {
     return std::nullopt;
   }
 
+  // Create TargetOptions with optional AsmVerbose support.
+  // Set MLIR_ASM_VERBOSE=1 environment variable to enable verbose assembly
+  // output with kernel info comments (NumVgprs, Occupancy, etc.)
+  llvm::TargetOptions Options;
+  if (const char *env = std::getenv("MLIR_ASM_VERBOSE")) {
+    Options.MCOptions.AsmVerbose = (std::string(env) == "1");
+  }
+
   // Create the target machine using the target.
   targetMachine.reset(target->createTargetMachine(llvm::Triple(triple), chip,
-                                                  features, {}, {}));
+                                                  features, Options, {}));
   if (!targetMachine)
     return std::nullopt;
   return targetMachine.get();
