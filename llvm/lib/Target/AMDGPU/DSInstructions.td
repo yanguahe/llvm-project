@@ -1386,6 +1386,8 @@ let SubtargetPredicate = HasGFX950Insts in {
   def : DSLoadTrPat <DS_READ_B64_TR_B16, v4bf16, int_amdgcn_ds_read_tr16_b64>;
 }
 
+def : DSLoadTrPat <DS_READ_B128, v4i32, int_amdgcn_ds_read_b128>;
+
 //===----------------------------------------------------------------------===//
 // Target-specific instruction encodings.
 //===----------------------------------------------------------------------===//

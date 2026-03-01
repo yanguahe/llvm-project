@@ -3145,6 +3145,7 @@ def int_amdgcn_ds_read_tr4_b64     : AMDGPULoadIntrinsic<local_ptr_ty>;
 def int_amdgcn_ds_read_tr6_b96     : AMDGPULoadIntrinsic<local_ptr_ty>;
 def int_amdgcn_ds_read_tr8_b64     : AMDGPULoadIntrinsic<local_ptr_ty>;
 def int_amdgcn_ds_read_tr16_b64    : AMDGPULoadIntrinsic<local_ptr_ty>;
+def int_amdgcn_ds_read_b128        : AMDGPULoadIntrinsic<local_ptr_ty>;
 
 // i32 @llvm.amdgcn.wave.id()
 def int_amdgcn_wave_id :
