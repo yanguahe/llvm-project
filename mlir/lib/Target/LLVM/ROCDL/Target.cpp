@@ -32,6 +32,7 @@
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/MC/MCSubtargetInfo.h"
 #include "llvm/MC/TargetRegistry.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/FileUtilities.h"
 #include "llvm/Support/Path.h"
@@ -413,6 +414,21 @@ std::optional<SmallVector<char, 0>> SerializeGPUModuleBase::moduleToObjectImpl(
 #undef DEBUG_TYPE
   if (targetOptions.getCompilationTarget() == gpu::CompilationTarget::Offload)
     return SerializeGPUModuleBase::moduleToObject(llvmModule);
+
+  // Apply cmdOptions as LLVM command-line flags so they reach the AMDGPU
+  // backend's scheduling and waitcnt-insertion passes.
+  {
+    auto cmdOpts = targetOptions.tokenizeCmdOptions();
+    if (!cmdOpts.second.empty()) {
+      SmallVector<const char *, 16> argv;
+      argv.push_back("mlir-rocdl");
+      argv.append(cmdOpts.second.begin(), cmdOpts.second.end());
+      llvm::cl::ResetAllOptionOccurrences();
+      llvm::cl::ParseCommandLineOptions(argv.size(), argv.data(),
+                                        "ROCDL LLVM backend options\n",
+                                        /*Errs=*/nullptr);
+    }
+  }
 
   std::optional<llvm::TargetMachine *> targetMachine =
       getOrCreateTargetMachine();
