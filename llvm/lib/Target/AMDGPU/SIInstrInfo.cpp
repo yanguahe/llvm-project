@@ -523,21 +523,6 @@ bool SIInstrInfo::getMemOperandsWithOffsetWidth(
     return true;
   }
 
-  if (isDS(LdSt)) {
-    BaseOp = getNamedOperand(LdSt, AMDGPU::OpName::addr);
-    if (BaseOp)
-      BaseOps.push_back(BaseOp);
-    OffsetOp = getNamedOperand(LdSt, AMDGPU::OpName::offset);
-    Offset = OffsetOp ? OffsetOp->getImm() : 0;
-    DataOpIdx = AMDGPU::getNamedOperandIdx(Opc, AMDGPU::OpName::vdst);
-    if (DataOpIdx == -1)
-      DataOpIdx = AMDGPU::getNamedOperandIdx(Opc, AMDGPU::OpName::data0);
-    if (DataOpIdx == -1)
-      return false;
-    Width = LocationSize::precise(getOpSize(LdSt, DataOpIdx));
-    return true;
-  }
-
   return false;
 }
 

@@ -109,9 +109,6 @@ public:
 
   GCNSchedStrategy(const MachineSchedContext *C);
 
-  bool tryCandidate(SchedCandidate &Cand, SchedCandidate &TryCand,
-                    SchedBoundary *Zone) const override;
-
   SUnit *pickNode(bool &IsTopNode) override;
 
   void schedNode(SUnit *SU, bool IsTopNode) override;

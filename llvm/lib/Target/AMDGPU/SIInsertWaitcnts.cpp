@@ -58,6 +58,12 @@ static cl::opt<bool>
                                "s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)"),
                       cl::init(false), cl::Hidden);
 
+static cl::opt<bool>
+    SkipLDSDMAVmcnt("amdgpu-skip-lds-dma-vmcnt",
+                    cl::desc("Skip vmcnt wait for LDS DMA (buffer_load_lds) "
+                             "before DS operations when alias info is absent"),
+                    cl::init(false), cl::Hidden);
+
 static cl::opt<bool> ForceEmitZeroLoadFlag(
     "amdgpu-waitcnt-load-forcezero",
     cl::desc("Force all waitcnt load counters to wait until 0"),
@@ -1953,10 +1959,10 @@ bool SIInsertWaitcnts::generateWaitcntInstBefore(MachineInstr &MI,
             if (MI.mayAlias(AA, *LDSDMAStores[I], true))
               ScoreBrackets.determineWait(LOAD_CNT, RegNo + I + 1, Wait);
           }
-        } else {
+        } else if (!SkipLDSDMAVmcnt) {
           ScoreBrackets.determineWait(LOAD_CNT, RegNo, Wait);
         }
-        if (Memop->isStore()) {
+        if (Memop->isStore() && !SkipLDSDMAVmcnt) {
           ScoreBrackets.determineWait(EXP_CNT, RegNo, Wait);
         }
       }

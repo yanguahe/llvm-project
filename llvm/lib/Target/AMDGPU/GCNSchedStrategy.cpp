@@ -130,99 +130,6 @@ void GCNSchedStrategy::initialize(ScheduleDAGMI *DAG) {
                     << ", SGPRExcessLimit = " << SGPRExcessLimit << "\n\n");
 }
 
-bool GCNSchedStrategy::tryCandidate(SchedCandidate &Cand,
-                                    SchedCandidate &TryCand,
-                                    SchedBoundary *Zone) const {
-  static unsigned CallCount = 0;
-  if (++CallCount == 1) {
-    LLVM_DEBUG(dbgs() << "GCNSchedStrategy::tryCandidate override active\n");
-  }
-  if (!Cand.isValid()) {
-    TryCand.Reason = NodeOrder;
-    return true;
-  }
-
-  if (tryGreater(biasPhysReg(TryCand.SU, TryCand.AtTop),
-                 biasPhysReg(Cand.SU, Cand.AtTop), TryCand, Cand, PhysReg))
-    return TryCand.Reason != NoCand;
-
-  if (DAG->isTrackingPressure() &&
-      tryPressure(TryCand.RPDelta.Excess, Cand.RPDelta.Excess, TryCand, Cand,
-                  RegExcess, TRI, DAG->MF))
-    return TryCand.Reason != NoCand;
-
-  if (DAG->isTrackingPressure() &&
-      tryPressure(TryCand.RPDelta.CriticalMax, Cand.RPDelta.CriticalMax,
-                  TryCand, Cand, RegCritical, TRI, DAG->MF))
-    return TryCand.Reason != NoCand;
-
-  bool SameBoundary = Zone != nullptr;
-
-  // When register pressure has headroom, prioritize memory clustering before
-  // stall/latency heuristics. This batches DS_READ/VMEM loads to enable
-  // fine-grained waitcnt pipelining with MFMA consumers.
-  unsigned CandZoneCluster = Cand.AtTop ? TopClusterID : BotClusterID;
-  unsigned TryCandZoneCluster = TryCand.AtTop ? TopClusterID : BotClusterID;
-  bool CandIsClusterSucc =
-      isTheSameCluster(CandZoneCluster, Cand.SU->ParentClusterIdx);
-  bool TryCandIsClusterSucc =
-      isTheSameCluster(TryCandZoneCluster, TryCand.SU->ParentClusterIdx);
-  if (!HasHighPressure) {
-    if (tryGreater(TryCandIsClusterSucc, CandIsClusterSucc, TryCand, Cand,
-                   Cluster))
-      return TryCand.Reason != NoCand;
-  }
-
-  if (SameBoundary) {
-    if (Rem.IsAcyclicLatencyLimited && !Zone->getCurrMOps() &&
-        tryLatency(TryCand, Cand, *Zone))
-      return TryCand.Reason != NoCand;
-
-    if (tryLess(Zone->getLatencyStallCycles(TryCand.SU),
-                Zone->getLatencyStallCycles(Cand.SU), TryCand, Cand, Stall))
-      return TryCand.Reason != NoCand;
-  }
-
-  // Fallback clustering when pressure is high.
-  if (HasHighPressure) {
-    if (tryGreater(TryCandIsClusterSucc, CandIsClusterSucc, TryCand, Cand,
-                   Cluster))
-      return TryCand.Reason != NoCand;
-  }
-
-  if (SameBoundary) {
-    if (tryLess(getWeakLeft(TryCand.SU, TryCand.AtTop),
-                getWeakLeft(Cand.SU, Cand.AtTop), TryCand, Cand, Weak))
-      return TryCand.Reason != NoCand;
-
-    TryCand.initResourceDelta(DAG, SchedModel);
-    if (tryLess(TryCand.ResDelta.CritResources, Cand.ResDelta.CritResources,
-                TryCand, Cand, ResourceReduce))
-      return TryCand.Reason != NoCand;
-    if (tryGreater(TryCand.ResDelta.DemandedResources,
-                   Cand.ResDelta.DemandedResources, TryCand, Cand,
-                   ResourceDemand))
-      return TryCand.Reason != NoCand;
-
-    if (tryLatency(TryCand, Cand, *Zone))
-      return TryCand.Reason != NoCand;
-  }
-
-  if (DAG->isTrackingPressure() &&
-      tryPressure(TryCand.RPDelta.CurrentMax, Cand.RPDelta.CurrentMax, TryCand,
-                  Cand, RegMax, TRI, DAG->MF))
-    return TryCand.Reason != NoCand;
-
-  if (SameBoundary) {
-    if ((Zone->isTop() && TryCand.SU->NodeNum < Cand.SU->NodeNum) ||
-        (!Zone->isTop() && TryCand.SU->NodeNum > Cand.SU->NodeNum)) {
-      TryCand.Reason = NodeOrder;
-      return true;
-    }
-  }
-  return false;
-}
-
 /// Checks whether \p SU can use the cached DAG pressure diffs to compute the
 /// current register pressure.
 ///
@@ -681,6 +588,10 @@ bool GCNMaxILPSchedStrategy::tryCandidate(SchedCandidate &Cand,
 
   // Keep clustered nodes together to encourage downstream peephole
   // optimizations which may reduce resource requirements.
+  //
+  // This is a best effort to set things up for a post-RA pass. Optimizations
+  // like generating loads of multiple registers should ideally be done within
+  // the scheduler pass by combining the loads during DAG postprocessing.
   unsigned CandZoneCluster = Cand.AtTop ? TopClusterID : BotClusterID;
   unsigned TryCandZoneCluster = TryCand.AtTop ? TopClusterID : BotClusterID;
   bool CandIsClusterSucc =
