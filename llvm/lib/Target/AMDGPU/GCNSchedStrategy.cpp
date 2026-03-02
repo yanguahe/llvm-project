@@ -133,10 +133,9 @@ void GCNSchedStrategy::initialize(ScheduleDAGMI *DAG) {
 bool GCNSchedStrategy::tryCandidate(SchedCandidate &Cand,
                                     SchedCandidate &TryCand,
                                     SchedBoundary *Zone) const {
-  static bool Printed = false;
-  if (!Printed) {
-    errs() << "[GCNSchedStrategy] tryCandidate override active\n";
-    Printed = true;
+  static unsigned CallCount = 0;
+  if (++CallCount == 1) {
+    LLVM_DEBUG(dbgs() << "GCNSchedStrategy::tryCandidate override active\n");
   }
   if (!Cand.isValid()) {
     TryCand.Reason = NodeOrder;
@@ -682,10 +681,6 @@ bool GCNMaxILPSchedStrategy::tryCandidate(SchedCandidate &Cand,
 
   // Keep clustered nodes together to encourage downstream peephole
   // optimizations which may reduce resource requirements.
-  //
-  // This is a best effort to set things up for a post-RA pass. Optimizations
-  // like generating loads of multiple registers should ideally be done within
-  // the scheduler pass by combining the loads during DAG postprocessing.
   unsigned CandZoneCluster = Cand.AtTop ? TopClusterID : BotClusterID;
   unsigned TryCandZoneCluster = TryCand.AtTop ? TopClusterID : BotClusterID;
   bool CandIsClusterSucc =
