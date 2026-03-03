@@ -66,12 +66,6 @@ def Write4PassDGEMM : SchedWrite;
 def Write8PassDGEMM : SchedWrite;
 def Write16PassDGEMM : SchedWrite;
 
-// GFX942 (MI308X): MFMA+VALU can't overlap. These use both HWXDL and HWVALU.
-def Write2PassMAI_942  : SchedWrite;
-def Write4PassMAI_942  : SchedWrite;
-def Write8PassMAI_942  : SchedWrite;
-def Write16PassMAI_942 : SchedWrite;
-
 // WMMA/SWMMA instructions
 def WriteXDL2PassWMMA : SchedWrite;
 def WriteXDL4PassWMMA : SchedWrite;
@@ -302,35 +296,25 @@ def : HWVALUWriteRes<WriteTrans64,     4>;
 def : HWVALUWriteRes<WriteIntMul,      1>;
 def : HWVALUWriteRes<Write64Bit,       1>;
 
-// GFX942 MFMA+VALU resource conflict: both use HWXDL and HWVALU.
-let ReleaseAtCycles = [2, 2] in
-def : HWWriteRes<Write2PassMAI_942,  [HWXDL, HWVALU], 2>;
-let ReleaseAtCycles = [4, 4] in
-def : HWWriteRes<Write4PassMAI_942,  [HWXDL, HWVALU], 4>;
-let ReleaseAtCycles = [8, 8] in
-def : HWWriteRes<Write8PassMAI_942,  [HWXDL, HWVALU], 8>;
-let ReleaseAtCycles = [16, 16] in
-def : HWWriteRes<Write16PassMAI_942, [HWXDL, HWVALU], 16>;
-
 def : InstRW<[WriteCopy], (instrs COPY)>;
 def : InstRW<[Write64Bit], (instregex "^V_ACCVGPR_WRITE_B32_e64$")>;
-def : InstRW<[Write2PassMAI_942,   MIMFMARead], (instregex "^V_MFMA_.32_4X4X")>;
+def : InstRW<[Write2PassMAI,   MIMFMARead], (instregex "^V_MFMA_.32_4X4X")>;
 
-def : InstRW<[Write4PassMAI_942,   MIMFMARead], (instregex "^V_MFMA_.32_16X16X8X")>;
-def : InstRW<[Write4PassMAI_942,   MIMFMARead], (instregex "^V_MFMA_.32_16X16X16")>;
-def : InstRW<[Write4PassMAI_942,   MIMFMARead], (instregex "^V_MFMA_.32_16X16X32")>;
-def : InstRW<[Write8PassMAI_942,   MIMFMARead], (instregex "^V_MFMA_.32_16X16X[14][FBI]")>;
+def : InstRW<[Write4PassMAI,   MIMFMARead], (instregex "^V_MFMA_.32_16X16X8X")>;
+def : InstRW<[Write4PassMAI,   MIMFMARead], (instregex "^V_MFMA_.32_16X16X16")>;
+def : InstRW<[Write4PassMAI,   MIMFMARead], (instregex "^V_MFMA_.32_16X16X32")>;
+def : InstRW<[Write8PassMAI,   MIMFMARead], (instregex "^V_MFMA_.32_16X16X[14][FBI]")>;
 
-def : InstRW<[Write8PassMAI_942,   MIMFMARead], (instregex "^V_MFMA_.32_32X32X4XF")>;
-def : InstRW<[Write8PassMAI_942,   MIMFMARead], (instregex "^V_MFMA_.32_32X32X8")>;
-def : InstRW<[Write8PassMAI_942,   MIMFMARead], (instregex "^V_MFMA_.32_32X32X16")>;
-def : InstRW<[Write16PassMAI_942,  MIMFMARead], (instregex "^V_MFMA_.32_32X32X[124][FBI]")>;
+def : InstRW<[Write8PassMAI,   MIMFMARead], (instregex "^V_MFMA_.32_32X32X4XF")>;
+def : InstRW<[Write8PassMAI,   MIMFMARead], (instregex "^V_MFMA_.32_32X32X8")>;
+def : InstRW<[Write8PassMAI,   MIMFMARead], (instregex "^V_MFMA_.32_32X32X16")>;
+def : InstRW<[Write16PassMAI,  MIMFMARead], (instregex "^V_MFMA_.32_32X32X[124][FBI]")>;
 
 def : InstRW<[Write4PassDGEMM, MIMFMARead], (instregex "^V_MFMA_.64_4X4X")>;
 def : InstRW<[Write8PassDGEMM, MIMFMARead], (instregex "^V_MFMA_.64_16X16X")>;
 
-def : InstRW<[Write4PassMAI_942,   MIMFMARead], (instregex "^V_SMFMAC_.32_16X16X")>;
-def : InstRW<[Write8PassMAI_942,   MIMFMARead], (instregex "^V_SMFMAC_.32_32X32X")>;
+def : InstRW<[Write4PassMAI,   MIMFMARead], (instregex "^V_SMFMAC_.32_16X16X")>;
+def : InstRW<[Write8PassMAI,   MIMFMARead], (instregex "^V_SMFMAC_.32_32X32X")>;
 
 } // End SchedModel = SIDPGFX942FullSpeedModel
 
