@@ -69,6 +69,13 @@ static cl::opt<bool> ForceEmitZeroLoadFlag(
     cl::desc("Force all waitcnt load counters to wait until 0"),
     cl::init(false), cl::Hidden);
 
+static cl::opt<bool> CoalesceDsWaitcnt(
+    "amdgpu-coalesce-ds-waitcnt",
+    cl::desc("Coalesce DS_CNT ladder waits: when a non-zero DS_CNT wait is "
+             "needed, force it to 0 so subsequent consumers see all reads as "
+             "complete, eliminating per-pair lgkmcnt instructions"),
+    cl::init(false), cl::Hidden);
+
 namespace {
 // Class of object that encapsulates latest instruction counter score
 // associated with the operand.  Used for determining whether
@@ -2047,6 +2054,12 @@ bool SIInsertWaitcnts::generateWaitcntInstBefore(MachineInstr &MI,
 
   // Verify that the wait is actually needed.
   ScoreBrackets.simplifyWaitcnt(Wait);
+
+  // Coalesce DS ladder waits: force any non-zero DS_CNT wait to 0 so that
+  // subsequent consumers in an MFMA chain see all reads as already complete,
+  // eliminating per-pair lgkmcnt(N), lgkmcnt(N-1), ... sequences.
+  if (CoalesceDsWaitcnt && Wait.DsCnt != ~0u && Wait.DsCnt > 0)
+    Wait.DsCnt = 0;
 
   // When forcing emit, we need to skip terminators because that would break the
   // terminators of the MBB if we emit a waitcnt between terminators.
