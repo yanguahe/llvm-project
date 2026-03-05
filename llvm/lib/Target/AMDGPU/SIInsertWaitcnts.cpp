@@ -76,6 +76,12 @@ static cl::opt<bool> CoalesceDsWaitcnt(
              "complete, eliminating per-pair lgkmcnt instructions"),
     cl::init(false), cl::Hidden);
 
+static cl::opt<bool> TrustBarrierWaitcnt(
+    "amdgpu-trust-barrier-waitcnt",
+    cl::desc("Trust explicit S_WAITCNT before S_BARRIER instead of forcing "
+             "all counters to zero. Use when user code places targeted waits."),
+    cl::init(false), cl::Hidden);
+
 namespace {
 // Class of object that encapsulates latest instruction counter score
 // associated with the operand.  Used for determining whether
@@ -2039,7 +2045,8 @@ bool SIInsertWaitcnts::generateWaitcntInstBefore(MachineInstr &MI,
   // In all other cases, ensure safety by ensuring that there are no outstanding
   // memory operations.
   if (MI.getOpcode() == AMDGPU::S_BARRIER &&
-      !ST->hasAutoWaitcntBeforeBarrier() && !ST->supportsBackOffBarrier()) {
+      !ST->hasAutoWaitcntBeforeBarrier() && !ST->supportsBackOffBarrier() &&
+      !TrustBarrierWaitcnt) {
     Wait = Wait.combined(WCG->getAllZeroWaitcnt(/*IncludeVSCnt=*/true));
   }
 

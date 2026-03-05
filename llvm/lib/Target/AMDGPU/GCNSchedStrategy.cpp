@@ -26,6 +26,7 @@
 #include "GCNSchedStrategy.h"
 #include "AMDGPUIGroupLP.h"
 #include "GCNRegPressure.h"
+#include "SIInstrInfo.h"
 #include "SIMachineFunctionInfo.h"
 #include "Utils/AMDGPUBaseInfo.h"
 #include "llvm/ADT/STLExtras.h"
@@ -66,6 +67,12 @@ static cl::opt<bool>
 static cl::opt<bool> GCNTrackers(
     "amdgpu-use-amdgpu-trackers", cl::Hidden,
     cl::desc("Use the AMDGPU specific RPTrackers during scheduling"),
+    cl::init(false));
+
+static cl::opt<bool> ClusterMFMA(
+    "amdgpu-cluster-mfma", cl::Hidden,
+    cl::desc("Cluster MFMA instructions together, keeping VALU in separate "
+             "windows. Beneficial on targets where MFMA+VALU cannot overlap."),
     cl::init(false));
 
 const unsigned ScheduleMetrics::ScaleFactor = 100;
@@ -553,6 +560,23 @@ bool GCNMaxILPSchedStrategy::tryCandidate(SchedCandidate &Cand,
       tryPressure(TryCand.RPDelta.Excess, Cand.RPDelta.Excess, TryCand, Cand,
                   RegExcess, TRI, DAG->MF))
     return TryCand.Reason != NoCand;
+
+  // On gfx942+, MFMA and VALU cannot execute simultaneously. Cluster MFMAs.
+  if (ClusterMFMA && Zone) {
+    bool TryIsMFMA = TryCand.SU && TryCand.SU->getInstr() &&
+                     SIInstrInfo::isMAI(*TryCand.SU->getInstr());
+    bool CandIsMFMA = Cand.SU && Cand.SU->getInstr() &&
+                      SIInstrInfo::isMAI(*Cand.SU->getInstr());
+    if (TryIsMFMA != CandIsMFMA) {
+      bool Prefer;
+      if (Zone->isTop())
+        Prefer = tryGreater(TryIsMFMA, CandIsMFMA, TryCand, Cand, Cluster);
+      else
+        Prefer = tryGreater(!TryIsMFMA, !CandIsMFMA, TryCand, Cand, Cluster);
+      if (Prefer)
+        return TryCand.Reason != NoCand;
+    }
+  }
 
   // Bias PhysReg Defs and copies to their uses and defined respectively.
   if (tryGreater(biasPhysReg(TryCand.SU, TryCand.AtTop),

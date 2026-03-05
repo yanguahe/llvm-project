@@ -617,6 +617,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAMDGPUTarget() {
   initializeAMDGPUPreloadKernelArgumentsLegacyPass(*PR);
   initializeSIInsertWaveGroupPrioPass(*PR);
   initializeSIScheduleKReadsPass(*PR);
+  initializeSIFixSchedBarrierOrderPass(*PR);
 }
 
 static std::unique_ptr<TargetLoweringObjectFile> createTLOF(const Triple &TT) {
@@ -1915,6 +1916,8 @@ void GCNPassConfig::addPreEmitPass() {
 
   if (isPassEnabled(EnableInsertDelayAlu, CodeGenOptLevel::Less))
     addPass(&AMDGPUInsertDelayAluID);
+
+  addPass(createSIFixSchedBarrierOrderPass());
 
   addPass(&BranchRelaxationPassID);
 }

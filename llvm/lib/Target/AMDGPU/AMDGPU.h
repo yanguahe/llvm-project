@@ -560,6 +560,9 @@ void initializeSIInsertWaveGroupPrioPass(PassRegistry &);
 FunctionPass *createSIScheduleKReadsPass();
 void initializeSIScheduleKReadsPass(PassRegistry &);
 
+FunctionPass *createSIFixSchedBarrierOrderPass();
+void initializeSIFixSchedBarrierOrderPass(PassRegistry &);
+
 void initializeGCNRewritePartialRegUsesLegacyPass(llvm::PassRegistry &);
 extern char &GCNRewritePartialRegUsesID;
 
