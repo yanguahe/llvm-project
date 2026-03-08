@@ -406,7 +406,7 @@ static std::string processOneLoop(std::string loop,
                                    const std::string &label,
                                    bool insertYield = true,
                                    bool fillHazardGap = false,
-                                   bool hoistVcmp = true) {
+                                   bool hoistVcmp = false) {
   // --- Pass 1: Move v_cmp_lt_i32_e64 before barrier wait ---
   size_t barrierWait = loop.find("s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)");
   if (barrierWait == std::string::npos)
@@ -525,9 +525,8 @@ static std::string processOneLoop(std::string loop,
   unsigned vmcntRelaxed = 0;
 
   // --- Pass 4a: Remove redundant vmcnt(0) in V staging ---
-  // Pattern: vmcnt(0) ... [no buffer/global loads] ... vmcnt(0)
-  // The second vmcnt(0) is redundant since no new VMEM ops were issued.
-  {
+  // DISABLED: the extra wait acts as a beneficial scheduling fence.
+  if (false) {
     size_t first = loop.find("s_waitcnt vmcnt(0)\n");
     if (first == std::string::npos)
       first = loop.find("s_waitcnt vmcnt(0)");
@@ -565,9 +564,8 @@ static std::string processOneLoop(std::string loop,
     }
   }
 
-  // --- Pass 4b: Replace pre-GEMM1 FULL wait with s_nop 0 ---
-  // DISABLED: removing/replacing this fence causes ~1.5T regression.
-  if (false) {
+  // --- Pass 4b: Replace pre-GEMM1 FULL wait with lgkmcnt(0) ---
+  {
     const std::string fullWait = "s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)";
     size_t pos = 0;
     while (true) {
@@ -593,16 +591,93 @@ static std::string processOneLoop(std::string loop,
               gap.find("ds_read") == std::string::npos &&
               gap.find("ds_write") == std::string::npos &&
               gap.find("ds_permute") == std::string::npos) {
-            loop.replace(fw, fullWait.size(), "s_nop 0");
+            loop.replace(fw, fullWait.size(), "s_waitcnt lgkmcnt(0)");
             vmcntRelaxed++;
             llvm::errs() << "[postProcessISA] Replaced pre-GEMM1 FULL wait"
-                         << " with s_nop in " << label << "\n";
+                         << " with lgkmcnt(0) in " << label << "\n";
             pos = fw + 6;
             continue;
           }
         }
       }
       pos = fw + 1;
+    }
+  }
+
+  // --- Pass 4c: Remove redundant consecutive vmcnt(0) ---
+  unsigned vmcnt0Removed = 0;
+  {
+    const std::string vm0 = "s_waitcnt vmcnt(0)";
+    size_t pos = 0;
+    while (true) {
+      size_t first = loop.find(vm0, pos);
+      if (first == std::string::npos) break;
+      // Skip if it's part of a FULL wait
+      std::string restFirst = loop.substr(first, 60);
+      if (restFirst.find("expcnt") != std::string::npos) {
+        pos = first + 20;
+        continue;
+      }
+      size_t firstEnd = loop.find('\n', first);
+      if (firstEnd == std::string::npos) break;
+      firstEnd++;
+      // Find next vmcnt(0) (standalone or FULL)
+      size_t second = loop.find(vm0, firstEnd);
+      if (second == std::string::npos) break;
+      std::string between = loop.substr(firstEnd, second - firstEnd);
+      if (between.find("buffer_load") == std::string::npos &&
+          between.find("global_load") == std::string::npos) {
+        std::string restSecond = loop.substr(second, 60);
+        if (restSecond.find("expcnt") == std::string::npos) {
+          // Standalone vmcnt(0) — remove it
+          size_t secLineStart = loop.rfind('\n', second);
+          secLineStart = (secLineStart == std::string::npos) ? 0 : secLineStart + 1;
+          size_t secLineEnd = loop.find('\n', second);
+          secLineEnd = (secLineEnd == std::string::npos) ? loop.size() : secLineEnd + 1;
+          loop.erase(secLineStart, secLineEnd - secLineStart);
+          vmcnt0Removed++;
+          llvm::errs() << "[postProcessISA] Removed redundant vmcnt(0) in "
+                       << label << "\n";
+          continue;
+        }
+      }
+      pos = firstEnd;
+    }
+  }
+
+  // --- Pass 4d: Remove redundant consecutive lgkmcnt(0) ---
+  unsigned lgkm0Removed = 0;
+  {
+    const std::string lk0 = "lgkmcnt(0)";
+    size_t pos = 0;
+    while (true) {
+      size_t first = loop.find(lk0, pos);
+      if (first == std::string::npos) break;
+      size_t firstEnd = loop.find('\n', first);
+      if (firstEnd == std::string::npos) break;
+      firstEnd++;
+      size_t second = loop.find(lk0, firstEnd);
+      if (second == std::string::npos) break;
+      std::string between = loop.substr(firstEnd, second - firstEnd);
+      if (between.find("ds_read") == std::string::npos &&
+          between.find("ds_write") == std::string::npos &&
+          between.find("ds_permute") == std::string::npos &&
+          between.find("buffer_load") == std::string::npos) {
+        // Check the second lgkmcnt(0) is standalone (not part of FULL wait)
+        size_t secLineStart = loop.rfind('\n', second);
+        secLineStart = (secLineStart == std::string::npos) ? 0 : secLineStart + 1;
+        std::string secLine = loop.substr(secLineStart, second + 15 - secLineStart);
+        if (secLine.find("expcnt") == std::string::npos) {
+          size_t secLineEnd = loop.find('\n', second);
+          secLineEnd = (secLineEnd == std::string::npos) ? loop.size() : secLineEnd + 1;
+          loop.erase(secLineStart, secLineEnd - secLineStart);
+          lgkm0Removed++;
+          llvm::errs() << "[postProcessISA] Removed redundant lgkmcnt(0) in "
+                       << label << "\n";
+          continue;
+        }
+      }
+      pos = firstEnd;
     }
   }
 
@@ -661,6 +736,8 @@ static std::string processOneLoop(std::string loop,
                << " v_cmp, yield=" << yieldInserted
                << ", nopFilled=" << nopFilled
                << ", vmcntRelaxed=" << vmcntRelaxed
+               << ", vmcnt0Removed=" << vmcnt0Removed
+               << ", lgkm0Removed=" << lgkm0Removed
                << ", setprioRemoved=" << setprioRemoved << "\n";
 
   return loop;
