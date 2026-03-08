@@ -1898,7 +1898,6 @@ void GCNPassConfig::addPreEmitPass() {
   addPass(&SILateBranchLoweringPassID);
   if (isPassEnabled(EnableSetWavePriority, CodeGenOptLevel::Less))
     addPass(createAMDGPUSetWavePriorityPass());
-  addPass(createSIInsertWaveGroupPrioPass());
   if (getOptLevel() > CodeGenOptLevel::None)
     addPass(&SIPreEmitPeepholeID);
   // The hazard recognizer that runs as part of the post-ra scheduler does not
@@ -1919,6 +1918,8 @@ void GCNPassConfig::addPreEmitPass() {
     addPass(&AMDGPUInsertDelayAluID);
 
   addPass(createSIFixSchedBarrierOrderPass());
+
+  addPass(createSIInsertWaveGroupPrioPass());
 
   addPass(&BranchRelaxationPassID);
 }

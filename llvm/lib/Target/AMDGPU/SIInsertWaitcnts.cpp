@@ -80,7 +80,7 @@ static cl::opt<bool> TrustBarrierWaitcnt(
     "amdgpu-trust-barrier-waitcnt",
     cl::desc("Trust explicit S_WAITCNT before S_BARRIER instead of forcing "
              "all counters to zero. Use when user code places targeted waits."),
-    cl::init(false), cl::Hidden);
+    cl::init(true), cl::Hidden);
 
 namespace {
 // Class of object that encapsulates latest instruction counter score
