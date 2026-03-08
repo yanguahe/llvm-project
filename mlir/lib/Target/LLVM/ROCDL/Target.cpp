@@ -433,11 +433,15 @@ static std::string processOneLoop(std::string loop,
   size_t searchPos = firstBarrier;
   std::vector<std::pair<size_t, size_t>> linesToRemove;
 
-  // Move e64 (SGPR-writing) v_cmp_lt_i32 for causal mask.
-  // Only safe when the comparison operands are loop-invariant across the barrier.
+  // Limit v_cmp hoisting to between the first and second barrier.
+  // With 2x unrolled loops, Body B's v_cmps would overwrite Body A's SGPRs
+  // if hoisted before the first barrier, corrupting mask predicates.
+  size_t secondBarrier = loop.find("s_barrier", firstBarrier + 10);
+  size_t vcmpSearchEnd = (secondBarrier != std::string::npos) ? secondBarrier : loop.size();
+
   while (hoistVcmp) {
     size_t pos = loop.find("v_cmp_lt_i32_e64 s[", searchPos);
-    if (pos == std::string::npos || pos >= loop.size())
+    if (pos == std::string::npos || pos >= vcmpSearchEnd)
       break;
     size_t lineStart = loop.rfind('\n', pos);
     if (lineStart == std::string::npos)
@@ -521,8 +525,23 @@ static std::string processOneLoop(std::string loop,
     }
   }
 
-  // --- Pass 3: Remove redundant s_waitcnt vmcnt(4) ---
+  // Detect 2x unrolled loops by counting barriers (>2 means multi-body).
+  // Skip aggressive waitcnt optimizations for multi-body loops to avoid
+  // incorrectly removing waits across body boundaries.
+  unsigned barrierCount = 0;
   {
+    size_t bpos = 0;
+    while (true) {
+      size_t b = loop.find("s_barrier", bpos);
+      if (b == std::string::npos) break;
+      barrierCount++;
+      bpos = b + 10;
+    }
+  }
+  bool isMultiBody = barrierCount > 2;
+
+  // --- Pass 3: Remove redundant s_waitcnt vmcnt(4) ---
+  if (!isMultiBody) {
     size_t pos = 0;
     while (true) {
       size_t first = loop.find("s_waitcnt vmcnt(4)", pos);
@@ -592,7 +611,7 @@ static std::string processOneLoop(std::string loop,
   }
 
   // --- Pass 4b: Replace pre-GEMM1 FULL wait with lgkmcnt(0) ---
-  {
+  if (!isMultiBody) {
     const std::string fullWait = "s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)";
     size_t pos = 0;
     while (true) {
@@ -633,7 +652,7 @@ static std::string processOneLoop(std::string loop,
 
   // --- Pass 4c: Remove redundant consecutive vmcnt(0) ---
   unsigned vmcnt0Removed = 0;
-  {
+  if (!isMultiBody) {
     const std::string vm0 = "s_waitcnt vmcnt(0)";
     size_t pos = 0;
     while (true) {
@@ -674,7 +693,7 @@ static std::string processOneLoop(std::string loop,
 
   // --- Pass 4d: Remove redundant consecutive lgkmcnt(0) ---
   unsigned lgkm0Removed = 0;
-  {
+  if (!isMultiBody) {
     const std::string lk0 = "lgkmcnt(0)";
     size_t pos = 0;
     while (true) {
@@ -807,9 +826,20 @@ static std::string postProcessISA(const std::string &isa) {
     std::string after = result.substr(loopEndLine);
     std::string loop = result.substr(loopStart, loopEndLine - loopStart);
 
+    // Count barriers to detect 2x unrolled loops (>2 barriers = multi-body)
+    unsigned loopBarriers = 0;
+    {
+      size_t bpos = 0;
+      while (true) {
+        size_t b = loop.find("s_barrier", bpos);
+        if (b == std::string::npos) break;
+        loopBarriers++;
+        bpos = b + 10;
+      }
+    }
     bool doYield = false;
     bool fillGap = false;
-    bool hoistVcmp = true;
+    bool hoistVcmp = (loopBarriers <= 2);
     loop = processOneLoop(std::move(loop), label, doYield, fillGap, hoistVcmp);
 
     // Pass 7: Move s_setprio around O rescale v_pk_mul block.
