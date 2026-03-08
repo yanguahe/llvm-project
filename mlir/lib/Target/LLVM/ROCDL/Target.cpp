@@ -407,23 +407,30 @@ static std::string processOneLoop(std::string loop,
                                    bool insertYield = true,
                                    bool fillHazardGap = false,
                                    bool hoistVcmp = false) {
-  // --- Pass 1: Move v_cmp_lt_i32_e64 before barrier wait ---
-  size_t barrierWait = loop.find("s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)");
-  if (barrierWait == std::string::npos)
+  // --- Pass 1: Move v_cmp_lt_i32_e64 before first barrier ---
+  size_t firstBarrier = loop.find("s_barrier");
+  if (firstBarrier == std::string::npos)
     return loop;
 
-  size_t barrierWaitLineStart = loop.rfind('\n', barrierWait);
-  if (barrierWaitLineStart == std::string::npos)
-    barrierWaitLineStart = 0;
-  else
-    barrierWaitLineStart++;
+  // Find the waitcnt line before the first barrier (insertion point)
+  size_t barrierLineStart = loop.rfind('\n', firstBarrier);
+  if (barrierLineStart == std::string::npos) barrierLineStart = 0;
+  else barrierLineStart++;
 
-  size_t afterBarrier = loop.find("s_barrier", barrierWait);
-  if (afterBarrier == std::string::npos)
-    return loop;
+  // Look for the s_waitcnt before the barrier
+  size_t insertPoint = barrierLineStart;
+  {
+    size_t lookBack = (barrierLineStart > 200) ? barrierLineStart - 200 : 0;
+    std::string beforeBarrier = loop.substr(lookBack, barrierLineStart - lookBack);
+    size_t lastWait = beforeBarrier.rfind("s_waitcnt");
+    if (lastWait != std::string::npos) {
+      size_t waitLineStart = beforeBarrier.rfind('\n', lastWait);
+      insertPoint = lookBack + ((waitLineStart == std::string::npos) ? 0 : waitLineStart + 1);
+    }
+  }
 
   std::vector<std::string> cmpLines;
-  size_t searchPos = afterBarrier;
+  size_t searchPos = firstBarrier;
   std::vector<std::pair<size_t, size_t>> linesToRemove;
 
   // Move e64 (SGPR-writing) v_cmp_lt_i32 for causal mask.
@@ -459,19 +466,28 @@ static std::string processOneLoop(std::string loop,
       loop.erase(linesToRemove[i].first,
                  linesToRemove[i].second - linesToRemove[i].first);
 
-    barrierWait = loop.find("s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)");
-    if (barrierWait == std::string::npos)
+    // Recalculate insert point after erasures
+    firstBarrier = loop.find("s_barrier");
+    if (firstBarrier == std::string::npos)
       return loop;
-    barrierWaitLineStart = loop.rfind('\n', barrierWait);
-    if (barrierWaitLineStart == std::string::npos)
-      barrierWaitLineStart = 0;
-    else
-      barrierWaitLineStart++;
+    barrierLineStart = loop.rfind('\n', firstBarrier);
+    if (barrierLineStart == std::string::npos) barrierLineStart = 0;
+    else barrierLineStart++;
+    insertPoint = barrierLineStart;
+    {
+      size_t lookBack = (barrierLineStart > 200) ? barrierLineStart - 200 : 0;
+      std::string beforeBarrier = loop.substr(lookBack, barrierLineStart - lookBack);
+      size_t lastWait = beforeBarrier.rfind("s_waitcnt");
+      if (lastWait != std::string::npos) {
+        size_t waitLineStart = beforeBarrier.rfind('\n', lastWait);
+        insertPoint = lookBack + ((waitLineStart == std::string::npos) ? 0 : waitLineStart + 1);
+      }
+    }
 
     std::string insertBlock;
     for (const auto &line : cmpLines)
       insertBlock += line;
-    loop.insert(barrierWaitLineStart, insertBlock);
+    loop.insert(insertPoint, insertBlock);
   }
 
   // --- Pass 2: Insert yield NOPs after the LAST s_setprio 0 (before barrier) ---
@@ -782,7 +798,7 @@ static std::string postProcessISA(const std::string &isa) {
 
     bool doYield = false;
     bool fillGap = false;
-    bool hoistVcmp = false;
+    bool hoistVcmp = true;
     loop = processOneLoop(std::move(loop), label, doYield, fillGap, hoistVcmp);
 
     // Pass 7: Move s_setprio around O rescale v_pk_mul block.
