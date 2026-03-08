@@ -476,7 +476,10 @@ public:
   std::optional<SmallVector<char, 0>>
   moduleToObject(llvm::Module &llvmModule) override;
 
+  LogicalResult optimizeModule(llvm::Module &module, int optL) override;
+
 private:
+  void applyCmdOptions();
   // Target options.
   gpu::TargetOptions targetOptions;
 };
@@ -486,6 +489,25 @@ AMDGPUSerializer::AMDGPUSerializer(Operation &module, ROCDLTargetAttr target,
                                    const gpu::TargetOptions &targetOptions)
     : SerializeGPUModuleBase(module, target, targetOptions),
       targetOptions(targetOptions) {}
+
+void AMDGPUSerializer::applyCmdOptions() {
+  auto cmdOpts = targetOptions.tokenizeCmdOptions();
+  if (!cmdOpts.second.empty()) {
+    SmallVector<const char *, 16> argv;
+    argv.push_back("mlir-rocdl");
+    argv.append(cmdOpts.second.begin(), cmdOpts.second.end());
+    llvm::cl::ResetAllOptionOccurrences();
+    llvm::cl::ParseCommandLineOptions(argv.size(), argv.data(),
+                                      "ROCDL LLVM backend options\n",
+                                      /*Errs=*/nullptr);
+  }
+}
+
+LogicalResult AMDGPUSerializer::optimizeModule(llvm::Module &module,
+                                               int optL) {
+  applyCmdOptions();
+  return SerializeGPUModuleBase::optimizeModule(module, optL);
+}
 
 std::optional<SmallVector<char, 0>>
 AMDGPUSerializer::moduleToObject(llvm::Module &llvmModule) {
