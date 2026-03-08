@@ -459,6 +459,17 @@ static std::string processOneLoop(std::string loop,
     searchPos = lineEnd;
   }
 
+  // Partial hoisting: keep the LAST keepNearGemm2 v_cmps in place (near GEMM2)
+  // to provide useful work that delays GEMM2 MFMA issue, reducing contention.
+  const int keepNearGemm2 = 4;
+  if ((int)cmpLines.size() > keepNearGemm2) {
+    cmpLines.erase(cmpLines.end() - keepNearGemm2, cmpLines.end());
+    linesToRemove.erase(linesToRemove.end() - keepNearGemm2, linesToRemove.end());
+  } else {
+    cmpLines.clear();
+    linesToRemove.clear();
+  }
+
   unsigned cmpMoved = cmpLines.size();
   unsigned nopFilled = 0;
   if (!cmpLines.empty()) {
