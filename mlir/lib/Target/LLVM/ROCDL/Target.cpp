@@ -402,6 +402,187 @@ SerializeGPUModuleBase::compileToBinary(const std::string &serializedISA) {
   return SmallVector<char, 0>(buffer.begin(), buffer.end());
 }
 
+static std::string processOneLoop(std::string loop,
+                                   const std::string &label,
+                                   bool insertYield = true,
+                                   bool fillHazardGap = false,
+                                   bool hoistVcmp = true) {
+  // --- Pass 1: Move v_cmp_lt_i32_e64 before barrier wait ---
+  size_t barrierWait = loop.find("s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)");
+  if (barrierWait == std::string::npos)
+    return loop;
+
+  size_t barrierWaitLineStart = loop.rfind('\n', barrierWait);
+  if (barrierWaitLineStart == std::string::npos)
+    barrierWaitLineStart = 0;
+  else
+    barrierWaitLineStart++;
+
+  size_t afterBarrier = loop.find("s_barrier", barrierWait);
+  if (afterBarrier == std::string::npos)
+    return loop;
+
+  std::vector<std::string> cmpLines;
+  size_t searchPos = afterBarrier;
+  std::vector<std::pair<size_t, size_t>> linesToRemove;
+
+  // Move e64 (SGPR-writing) v_cmp_lt_i32 for causal mask.
+  // Only safe when the comparison operands are loop-invariant across the barrier.
+  while (hoistVcmp) {
+    size_t pos = loop.find("v_cmp_lt_i32_e64 s[", searchPos);
+    if (pos == std::string::npos || pos >= loop.size())
+      break;
+    size_t lineStart = loop.rfind('\n', pos);
+    if (lineStart == std::string::npos)
+      lineStart = 0;
+    else
+      lineStart++;
+    size_t lineEnd = loop.find('\n', pos);
+    if (lineEnd == std::string::npos)
+      lineEnd = loop.size();
+    else
+      lineEnd++;
+
+    std::string line = loop.substr(lineStart, lineEnd - lineStart);
+    if (line.find("s[4:5]") == std::string::npos &&
+        line.find("s[0:1]") == std::string::npos) {
+      cmpLines.push_back(line);
+      linesToRemove.push_back({lineStart, lineEnd});
+    }
+    searchPos = lineEnd;
+  }
+
+  unsigned cmpMoved = cmpLines.size();
+  unsigned nopFilled = 0;
+  if (!cmpLines.empty()) {
+    for (int i = linesToRemove.size() - 1; i >= 0; i--)
+      loop.erase(linesToRemove[i].first,
+                 linesToRemove[i].second - linesToRemove[i].first);
+
+    barrierWait = loop.find("s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)");
+    if (barrierWait == std::string::npos)
+      return loop;
+    barrierWaitLineStart = loop.rfind('\n', barrierWait);
+    if (barrierWaitLineStart == std::string::npos)
+      barrierWaitLineStart = 0;
+    else
+      barrierWaitLineStart++;
+
+    std::string insertBlock;
+    for (const auto &line : cmpLines)
+      insertBlock += line;
+    loop.insert(barrierWaitLineStart, insertBlock);
+  }
+
+  // --- Pass 2: Insert yield NOPs after the LAST s_setprio 0 ---
+  unsigned yieldInserted = 0;
+  size_t setprio0 = insertYield ? loop.rfind("s_setprio 0") : std::string::npos;
+  if (setprio0 != std::string::npos) {
+    size_t asmEnd = loop.find(";;#ASMEND", setprio0);
+    if (asmEnd != std::string::npos) {
+      size_t asmEndLine = loop.find('\n', asmEnd);
+      if (asmEndLine != std::string::npos) {
+        asmEndLine++;
+        std::string nextChunk = loop.substr(asmEndLine,
+            std::min((size_t)40, loop.size() - asmEndLine));
+        if (nextChunk.find("s_nop 15") == std::string::npos &&
+            nextChunk.find("s_nop 7") == std::string::npos) {
+          loop.insert(asmEndLine, "\ts_nop 15\n\ts_nop 7\n");
+          yieldInserted = 1;
+        }
+      }
+    }
+  }
+
+  // --- Pass 3: Remove redundant s_waitcnt vmcnt(4) ---
+  {
+    size_t pos = 0;
+    while (true) {
+      size_t first = loop.find("s_waitcnt vmcnt(4)", pos);
+      if (first == std::string::npos) break;
+      size_t firstEnd = loop.find('\n', first);
+      if (firstEnd == std::string::npos) break;
+      firstEnd++;
+      size_t second = loop.find("s_waitcnt vmcnt(4)", firstEnd);
+      if (second == std::string::npos) break;
+      std::string between = loop.substr(firstEnd, second - firstEnd);
+      if (between.find("buffer_load") == std::string::npos &&
+          between.find("global_load") == std::string::npos) {
+        size_t secLineStart = loop.rfind('\n', second);
+        if (secLineStart == std::string::npos) secLineStart = 0;
+        else secLineStart++;
+        size_t secLineEnd = loop.find('\n', second);
+        if (secLineEnd != std::string::npos) secLineEnd++;
+        else secLineEnd = loop.size();
+        loop.erase(secLineStart, secLineEnd - secLineStart);
+        llvm::errs() << "[postProcessISA] Removed redundant vmcnt(4) in "
+                     << label << "\n";
+      }
+      pos = firstEnd;
+    }
+  }
+
+  llvm::errs() << "[postProcessISA] " << label << ": moved " << cmpMoved
+               << " v_cmp, yield=" << yieldInserted
+               << ", nopFilled=" << nopFilled << "\n";
+
+  return loop;
+}
+
+static std::string postProcessISA(const std::string &isa) {
+  std::string result = isa;
+
+  // Find all inner loop labels with backward branch (s_cbranch_vccnz .LBBx_y)
+  std::vector<std::string> loopLabels;
+  for (int fn = 0; fn <= 1; fn++) {
+    for (int bb = 0; bb <= 15; bb++) {
+      std::string label = ".LBB" + std::to_string(fn) + "_" + std::to_string(bb);
+      std::string labelColon = label + ":";
+      std::string branchTarget = "s_cbranch_vccnz " + label;
+      size_t labelPos = result.find(labelColon);
+      if (labelPos != std::string::npos) {
+        size_t branchPos = result.find(branchTarget, labelPos);
+        if (branchPos != std::string::npos)
+          loopLabels.push_back(label);
+      }
+    }
+  }
+
+  for (const auto &label : loopLabels) {
+    std::string labelColon = label + ":";
+    std::string branchTarget = "s_cbranch_vccnz " + label;
+
+    size_t loopStart = result.find(labelColon);
+    if (loopStart == std::string::npos)
+      continue;
+    size_t loopEnd = result.find(branchTarget, loopStart);
+    if (loopEnd == std::string::npos)
+      continue;
+    size_t loopEndLine = result.find('\n', loopEnd);
+    if (loopEndLine == std::string::npos)
+      loopEndLine = result.size();
+
+    std::string before = result.substr(0, loopStart);
+    std::string after = result.substr(loopEndLine);
+    std::string loop = result.substr(loopStart, loopEndLine - loopStart);
+
+    bool doYield = false;
+    bool fillGap = false;
+    bool hoistVcmp = true;
+    loop = processOneLoop(std::move(loop), label, doYield, fillGap, hoistVcmp);
+    result = before + loop + after;
+  }
+
+  {
+    std::error_code ec;
+    llvm::raw_fd_ostream dumpFile("/tmp/postprocess_isa.s", ec);
+    if (!ec)
+      dumpFile << result;
+  }
+
+  return result;
+}
+
 std::optional<SmallVector<char, 0>> SerializeGPUModuleBase::moduleToObjectImpl(
     const gpu::TargetOptions &targetOptions, llvm::Module &llvmModule) {
   // Return LLVM IR if the compilation target is offload.
@@ -417,16 +598,40 @@ std::optional<SmallVector<char, 0>> SerializeGPUModuleBase::moduleToObjectImpl(
 
   // Apply cmdOptions as LLVM command-line flags so they reach the AMDGPU
   // backend's scheduling and waitcnt-insertion passes.
+  // Filter out unregistered options to avoid ParseCommandLineOptions aborting
+  // on the first unknown flag and skipping all subsequent valid flags.
   {
     auto cmdOpts = targetOptions.tokenizeCmdOptions();
     if (!cmdOpts.second.empty()) {
+      auto &registeredOpts =
+          llvm::cl::getRegisteredOptions(llvm::cl::SubCommand::getTopLevel());
       SmallVector<const char *, 16> argv;
       argv.push_back("mlir-rocdl");
-      argv.append(cmdOpts.second.begin(), cmdOpts.second.end());
-      llvm::cl::ResetAllOptionOccurrences();
-      llvm::cl::ParseCommandLineOptions(argv.size(), argv.data(),
-                                        "ROCDL LLVM backend options\n",
-                                        /*Errs=*/nullptr);
+      for (const char *opt : cmdOpts.second) {
+        StringRef s(opt);
+        StringRef name = s;
+        if (name.starts_with("--"))
+          name = name.drop_front(2);
+        else if (name.starts_with("-"))
+          name = name.drop_front(1);
+        name = name.split('=').first;
+        if (registeredOpts.count(name)) {
+          argv.push_back(opt);
+        } else {
+          llvm::errs() << "ROCDL: skipping unregistered option: " << s << "\n";
+        }
+      }
+      if (argv.size() > 1) {
+        llvm::cl::ResetAllOptionOccurrences();
+        std::string parseErrs;
+        llvm::raw_string_ostream errStream(parseErrs);
+        if (!llvm::cl::ParseCommandLineOptions(argv.size(), argv.data(),
+                                               "ROCDL LLVM backend options\n",
+                                               &errStream)) {
+          llvm::errs() << "Warning: LLVM opts parse error: " << parseErrs
+                       << "\n";
+        }
+      }
     }
   }
 
@@ -445,6 +650,10 @@ std::optional<SmallVector<char, 0>> SerializeGPUModuleBase::moduleToObjectImpl(
     getOperation().emitError() << "failed translating the module to ISA";
     return std::nullopt;
   }
+
+  // Post-process ISA: insert yield nops after s_setprio 0 in inner loops.
+  *serializedISA = postProcessISA(*serializedISA);
+
 #define DEBUG_TYPE "serialize-to-isa"
   LLVM_DEBUG({
     llvm::dbgs() << "ISA for module: "
