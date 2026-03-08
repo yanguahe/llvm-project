@@ -109,6 +109,8 @@ private:
 
   bool hoistMFMAOverDSPermute(MachineBasicBlock &MBB);
 
+  bool sinkBreakersFromMFMAChain(MachineBasicBlock &MBB);
+
   bool tryRenameDSPermuteDst(MachineBasicBlock &MBB, MachineInstr &Perm,
                              MachineInstr &MFMAToMove,
                              MachineBasicBlock::iterator InsertPt);
@@ -493,6 +495,111 @@ bool SIFixSchedBarrierOrderImpl::hoistMFMAOverDSPermute(
   return Changed;
 }
 
+static bool isRegAllocArtifact(const MachineInstr &MI) {
+  unsigned Opc = MI.getOpcode();
+  switch (Opc) {
+  case AMDGPU::V_MOV_B32_e32:
+  case AMDGPU::V_MOV_B32_e64:
+  case AMDGPU::SCRATCH_LOAD_DWORD:
+  case AMDGPU::SCRATCH_LOAD_DWORD_SADDR:
+  case AMDGPU::SCRATCH_LOAD_DWORDX2:
+  case AMDGPU::SCRATCH_LOAD_DWORDX2_SADDR:
+  case AMDGPU::SCRATCH_STORE_DWORD:
+  case AMDGPU::SCRATCH_STORE_DWORD_SADDR:
+  case AMDGPU::SCRATCH_STORE_DWORDX2:
+  case AMDGPU::SCRATCH_STORE_DWORDX2_SADDR:
+    return true;
+  default:
+    return false;
+  }
+}
+
+bool SIFixSchedBarrierOrderImpl::sinkBreakersFromMFMAChain(
+    MachineBasicBlock &MBB) {
+  bool Changed = false;
+
+  for (auto It = MBB.begin(); It != MBB.end();) {
+    if (!isMFMA(*It)) {
+      ++It;
+      continue;
+    }
+
+    struct ChainEntry {
+      MachineInstr *MI;
+      bool IsMFMA;
+    };
+    SmallVector<ChainEntry, 32> Chain;
+    auto Scan = It;
+
+    while (Scan != MBB.end()) {
+      if (isMFMA(*Scan)) {
+        Chain.push_back({&*Scan, true});
+        ++Scan;
+      } else if (isRegAllocArtifact(*Scan)) {
+        Chain.push_back({&*Scan, false});
+        ++Scan;
+      } else {
+        break;
+      }
+    }
+
+    unsigned MFMACount = 0, BreakerCount = 0;
+    for (auto &E : Chain) {
+      if (E.IsMFMA)
+        MFMACount++;
+      else
+        BreakerCount++;
+    }
+
+    if (BreakerCount == 0 || MFMACount < 3) {
+      It = Scan;
+      continue;
+    }
+
+    MachineInstr *LastMFMA = nullptr;
+    for (auto &E : Chain)
+      if (E.IsMFMA)
+        LastMFMA = E.MI;
+
+    auto SinkPt = std::next(LastMFMA->getIterator());
+
+    for (unsigned i = 0; i < Chain.size(); ++i) {
+      if (Chain[i].IsMFMA)
+        continue;
+
+      bool HasMFMAAfter = false;
+      for (unsigned j = i + 1; j < Chain.size(); ++j) {
+        if (Chain[j].IsMFMA) {
+          HasMFMAAfter = true;
+          break;
+        }
+      }
+      if (!HasMFMAAfter)
+        continue;
+
+      MachineInstr *Breaker = Chain[i].MI;
+      bool CanSink = true;
+      for (unsigned j = i + 1; j < Chain.size(); ++j) {
+        if (!Chain[j].IsMFMA)
+          continue;
+        if (regsConflict(*Breaker, *Chain[j].MI)) {
+          CanSink = false;
+          break;
+        }
+      }
+
+      if (CanSink) {
+        MBB.splice(SinkPt, &MBB, Breaker);
+        Changed = true;
+      }
+    }
+
+    It = Scan;
+  }
+
+  return Changed;
+}
+
 bool SIFixSchedBarrierOrderImpl::run(MachineFunction &MF) {
   const GCNSubtarget &ST = MF.getSubtarget<GCNSubtarget>();
   const SIInstrInfo *TII = ST.getInstrInfo();
@@ -502,6 +609,7 @@ bool SIFixSchedBarrierOrderImpl::run(MachineFunction &MF) {
   for (MachineBasicBlock &MBB : MF) {
     Changed |= processBlock(MBB, *TII);
     Changed |= hoistMFMAOverDSPermute(MBB);
+    Changed |= sinkBreakersFromMFMAChain(MBB);
   }
 
   return Changed;
