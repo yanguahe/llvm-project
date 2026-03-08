@@ -23,6 +23,7 @@
 #include "AMDGPUIGroupLP.h"
 #include "AMDGPUISelDAGToDAG.h"
 #include "AMDGPULowerVGPREncoding.h"
+#include "SIFixSchedBarrierOrder.h"
 #include "AMDGPUMacroFusion.h"
 #include "AMDGPUPerfHintAnalysis.h"
 #include "AMDGPUPreloadKernArgProlog.h"
@@ -617,7 +618,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAMDGPUTarget() {
   initializeAMDGPUPreloadKernelArgumentsLegacyPass(*PR);
   initializeSIInsertWaveGroupPrioPass(*PR);
   initializeSIScheduleKReadsPass(*PR);
-  initializeSIFixSchedBarrierOrderPass(*PR);
+  initializeSIFixSchedBarrierOrderLegacyPass(*PR);
 }
 
 static std::unique_ptr<TargetLoweringObjectFile> createTLOF(const Triple &TT) {
@@ -2508,6 +2509,8 @@ void AMDGPUCodeGenPassBuilder::addPreEmitPass(AddMachinePass &addPass) const {
   if (isPassEnabled(EnableInsertDelayAlu, CodeGenOptLevel::Less)) {
     addPass(AMDGPUInsertDelayAluPass());
   }
+
+  addPass(SIFixSchedBarrierOrderPass());
 
   addPass(BranchRelaxationPass());
 }

@@ -561,7 +561,7 @@ FunctionPass *createSIScheduleKReadsPass();
 void initializeSIScheduleKReadsPass(PassRegistry &);
 
 FunctionPass *createSIFixSchedBarrierOrderPass();
-void initializeSIFixSchedBarrierOrderPass(PassRegistry &);
+void initializeSIFixSchedBarrierOrderLegacyPass(PassRegistry &);
 
 void initializeGCNRewritePartialRegUsesLegacyPass(llvm::PassRegistry &);
 extern char &GCNRewritePartialRegUsesID;

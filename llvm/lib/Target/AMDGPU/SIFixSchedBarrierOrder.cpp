@@ -1,14 +1,14 @@
 //===- SIFixSchedBarrierOrder.cpp - Consolidate MFMAs before buffer_loads -===//
 //
-// Post-hazard-recognizer pass that separates V-prefetch buffer_loads from
-// GEMM1 MFMA chains by hoisting MFMAs over v_add_u32+buffer_load blocks.
-//
-// Currently a no-op in practice: the actual compilation already places
-// buffer_loads correctly in Phase 5 (after MFMA chain). The ISA dump showing
-// interleaving is from a separate LLVM compilation with different RA.
+// Post-hazard-recognizer pass:
+// 1. Separates V-prefetch buffer_loads from GEMM1 MFMA chains.
+// 2. Ensures exactly 1 MFMA before each ds_permute_b32 (matching reference
+//    ASM pattern). Uses register renaming to resolve WAR conflicts when
+//    the scheduler places 2+ MFMAs before ds_permute.
 //
 //===----------------------------------------------------------------------===//
 
+#include "SIFixSchedBarrierOrder.h"
 #include "AMDGPU.h"
 #include "GCNSubtarget.h"
 #include "MCTargetDesc/AMDGPUMCTargetDesc.h"
@@ -22,18 +22,10 @@ using namespace llvm;
 
 namespace {
 
-class SIFixSchedBarrierOrder : public MachineFunctionPass {
+// Core implementation shared by legacy and new pass manager wrappers.
+class SIFixSchedBarrierOrderImpl {
 public:
-  static char ID;
-  SIFixSchedBarrierOrder() : MachineFunctionPass(ID) {
-    initializeSIFixSchedBarrierOrderPass(*PassRegistry::getPassRegistry());
-  }
-
-  StringRef getPassName() const override {
-    return "SI Fix SCHED_BARRIER Ordering";
-  }
-
-  bool runOnMachineFunction(MachineFunction &MF) override;
+  bool run(MachineFunction &MF);
 
 private:
   const SIRegisterInfo *TRI = nullptr;
@@ -116,6 +108,10 @@ private:
 
   bool hoistMFMAOverDSPermute(MachineBasicBlock &MBB);
 
+  bool tryRenameDSPermuteDst(MachineBasicBlock &MBB, MachineInstr &Perm,
+                             MachineInstr &MFMAToMove,
+                             MachineBasicBlock::iterator InsertPt);
+
   bool readsAnyDefOf(const MachineInstr &MI,
                      ArrayRef<MachineInstr *> Defs) const {
     for (const MachineInstr *D : Defs) {
@@ -134,19 +130,52 @@ private:
   }
 };
 
+// Legacy pass manager wrapper.
+class SIFixSchedBarrierOrderLegacy : public MachineFunctionPass {
+public:
+  static char ID;
+  SIFixSchedBarrierOrderLegacy() : MachineFunctionPass(ID) {
+    initializeSIFixSchedBarrierOrderLegacyPass(*PassRegistry::getPassRegistry());
+  }
+
+  StringRef getPassName() const override {
+    return "SI Fix SCHED_BARRIER Ordering";
+  }
+
+  bool runOnMachineFunction(MachineFunction &MF) override {
+    return SIFixSchedBarrierOrderImpl().run(MF);
+  }
+};
+
 } // end anonymous namespace
 
-char SIFixSchedBarrierOrder::ID = 0;
+char SIFixSchedBarrierOrderLegacy::ID = 0;
 
-INITIALIZE_PASS(SIFixSchedBarrierOrder, DEBUG_TYPE,
+INITIALIZE_PASS(SIFixSchedBarrierOrderLegacy, DEBUG_TYPE,
                 "SI Fix SCHED_BARRIER Ordering", false, false)
 
 FunctionPass *llvm::createSIFixSchedBarrierOrderPass() {
-  return new SIFixSchedBarrierOrder();
+  return new SIFixSchedBarrierOrderLegacy();
 }
 
-bool SIFixSchedBarrierOrder::processBlock(MachineBasicBlock &MBB,
-                                          const SIInstrInfo &TII) {
+// New pass manager entry point.
+PreservedAnalyses
+SIFixSchedBarrierOrderPass::run(MachineFunction &MF,
+                                MachineFunctionAnalysisManager &MFAM) {
+  if (!SIFixSchedBarrierOrderImpl().run(MF))
+    return PreservedAnalyses::all();
+
+  PreservedAnalyses PA;
+  PA.preserveSet<CFGAnalyses>();
+  return PA;
+}
+
+//===----------------------------------------------------------------------===//
+// Core implementation
+//===----------------------------------------------------------------------===//
+
+bool SIFixSchedBarrierOrderImpl::processBlock(MachineBasicBlock &MBB,
+                                              const SIInstrInfo &TII) {
   bool Changed = false;
 
   SmallVector<MachineInstr *, 16> HWBarriers;
@@ -268,43 +297,202 @@ bool SIFixSchedBarrierOrder::processBlock(MachineBasicBlock &MBB,
   return Changed;
 }
 
-bool SIFixSchedBarrierOrder::hoistMFMAOverDSPermute(MachineBasicBlock &MBB) {
+bool SIFixSchedBarrierOrderImpl::tryRenameDSPermuteDst(
+    MachineBasicBlock &MBB, MachineInstr &Perm, MachineInstr &MFMAToMove,
+    MachineBasicBlock::iterator InsertPt) {
+
+  Register PermDst;
+  for (const MachineOperand &MO : Perm.operands()) {
+    if (MO.isReg() && MO.isDef()) {
+      PermDst = MO.getReg();
+      break;
+    }
+  }
+  if (!PermDst.isValid() || !PermDst.isPhysical())
+    return false;
+
+  const MachineRegisterInfo &MRI = MBB.getParent()->getRegInfo();
+
+  bool HasWAR = false;
+  for (const MachineOperand &MO : MFMAToMove.operands()) {
+    if (MO.isReg() && MO.isUse() && TRI->regsOverlap(MO.getReg(), PermDst)) {
+      HasWAR = true;
+      break;
+    }
+  }
+  if (!HasWAR)
+    return false;
+
+  MachineInstr *FirstUse = nullptr;
+  for (auto FIt = std::next(Perm.getIterator()); FIt != MBB.end(); ++FIt) {
+    for (const MachineOperand &MO : FIt->operands()) {
+      if (MO.isReg() && MO.isUse() && MO.getReg() == PermDst) {
+        FirstUse = &*FIt;
+        goto found_use;
+      }
+    }
+  }
+found_use:
+  if (!FirstUse)
+    return false;
+
+  MachineInstr *ClosestMFMA = nullptr;
+  {
+    auto Prev = Perm.getIterator();
+    if (Prev != MBB.begin()) {
+      --Prev;
+      if (isMFMA(*Prev))
+        ClosestMFMA = &*Prev;
+    }
+  }
+  if (!ClosestMFMA)
+    return false;
+
+  SmallVector<MCPhysReg, 8> Candidates;
+  for (const MachineOperand &MO : ClosestMFMA->operands()) {
+    if (!MO.isReg() || !MO.isUse() || !MO.getReg().isPhysical())
+      continue;
+    if (!TRI->isVGPR(MRI, MO.getReg()))
+      continue;
+    MCPhysReg R = MO.getReg().asMCReg();
+    for (MCSubRegIterator Sub(R, TRI, /*IncludeSelf=*/true); Sub.isValid();
+         ++Sub) {
+      if (AMDGPU::VGPR_32RegClass.contains(*Sub))
+        Candidates.push_back(*Sub);
+    }
+  }
+
+  MCPhysReg FreeReg = AMDGPU::NoRegister;
+  for (MCPhysReg Cand : Candidates) {
+    if (Cand == PermDst.asMCReg())
+      continue;
+
+    bool Conflict = false;
+    for (auto ChkIt = std::next(Perm.getIterator());
+         ChkIt != std::next(FirstUse->getIterator()); ++ChkIt) {
+      for (const MachineOperand &MO : ChkIt->operands()) {
+        if (!MO.isReg())
+          continue;
+        Register R = MO.getReg();
+        if (&*ChkIt == FirstUse && R == PermDst)
+          continue;
+        if (TRI->regsOverlap(R, Cand)) {
+          Conflict = true;
+          break;
+        }
+      }
+      if (Conflict)
+        break;
+    }
+    if (Conflict)
+      continue;
+
+    bool ConflictsWithMFMA = false;
+    for (const MachineOperand &MO : MFMAToMove.operands()) {
+      if (MO.isReg() && TRI->regsOverlap(Cand, MO.getReg())) {
+        ConflictsWithMFMA = true;
+        break;
+      }
+    }
+    if (ConflictsWithMFMA)
+      continue;
+
+    FreeReg = Cand;
+    break;
+  }
+
+  if (FreeReg == AMDGPU::NoRegister)
+    return false;
+
+  for (MachineOperand &MO : Perm.operands()) {
+    if (MO.isReg() && MO.isDef() && MO.getReg() == PermDst)
+      MO.setReg(FreeReg);
+  }
+
+  for (auto RenIt = std::next(Perm.getIterator()); RenIt != MBB.end();
+       ++RenIt) {
+    bool FoundDef = false;
+    for (const MachineOperand &MO : RenIt->operands()) {
+      if (MO.isReg() && MO.isDef() &&
+          TRI->regsOverlap(MO.getReg(), PermDst)) {
+        FoundDef = true;
+        break;
+      }
+    }
+    for (MachineOperand &MO : RenIt->operands()) {
+      if (MO.isReg() && MO.isUse() && MO.getReg() == PermDst)
+        MO.setReg(FreeReg);
+    }
+    if (FoundDef)
+      break;
+  }
+
+  MBB.splice(InsertPt, &MBB, MFMAToMove);
+  return true;
+}
+
+bool SIFixSchedBarrierOrderImpl::hoistMFMAOverDSPermute(
+    MachineBasicBlock &MBB) {
   bool Changed = false;
-  const MachineFunction *MF = MBB.getParent();
 
   for (auto It = MBB.begin(); It != MBB.end(); ++It) {
-    unsigned Opc = It->getOpcode();
-    if (Opc == AMDGPU::DS_PERMUTE_B32 || Opc == AMDGPU::DS_BPERMUTE_B32) {
-      MachineInstr &Perm = *It;
-      auto Next = std::next(It);
-      while (Next != MBB.end() && isNopOrWaitcnt(*Next))
-        ++Next;
-      if (Next == MBB.end()) {
-        continue;
-      }
-      if (!isMFMA(*Next)) {
-        errs() << "SIFixSBO[" << MF->getName() << " BB"
-               << MBB.getNumber() << "]: skip, next=" << Next->getOpcode()
-               << "\n";
-        continue;
-      }
+    if (!isDSPermute(*It))
+      continue;
 
-      MachineInstr &MFMA = *Next;
-      if (regsConflict(Perm, MFMA)) {
-        continue;
-      }
+    MachineInstr &Perm = *It;
 
-      auto PermIt = Perm.getIterator();
-      auto MFMAIt = MFMA.getIterator();
-      MBB.splice(PermIt, &MBB, MFMAIt);
-      Changed = true;
+    // Collect consecutive MFMAs immediately before ds_permute,
+    // skipping SCHED_BARRIER pseudo-instructions (removed during emission).
+    SmallVector<MachineInstr *, 4> MFMAsBefore;
+    {
+      auto Scan = It;
+      while (Scan != MBB.begin()) {
+        --Scan;
+        if (isMFMA(*Scan))
+          MFMAsBefore.push_back(&*Scan);
+        else if (Scan->getOpcode() == AMDGPU::SCHED_BARRIER)
+          continue; // skip SCHED_BARRIERs
+        else
+          break;
+      }
     }
+
+    if (MFMAsBefore.size() > 1) {
+      auto IPt = std::next(It);
+      for (int i = MFMAsBefore.size() - 1; i >= 1; --i) {
+        MachineInstr *MI = MFMAsBefore[i];
+        if (!regsConflict(Perm, *MI)) {
+          MBB.splice(IPt, &MBB, MI);
+          Changed = true;
+        } else {
+          Changed |= tryRenameDSPermuteDst(MBB, Perm, *MI, IPt);
+        }
+      }
+      continue;
+    }
+
+    if (MFMAsBefore.size() == 1)
+      continue;
+
+    // No MFMA before ds_permute: hoist one from after.
+    auto Next = std::next(It);
+    while (Next != MBB.end() && isNopOrWaitcnt(*Next))
+      ++Next;
+    if (Next == MBB.end() || !isMFMA(*Next))
+      continue;
+
+    MachineInstr &MFMA = *Next;
+    if (regsConflict(Perm, MFMA))
+      continue;
+
+    MBB.splice(Perm.getIterator(), &MBB, MFMA.getIterator());
+    Changed = true;
   }
 
   return Changed;
 }
 
-bool SIFixSchedBarrierOrder::runOnMachineFunction(MachineFunction &MF) {
+bool SIFixSchedBarrierOrderImpl::run(MachineFunction &MF) {
   const GCNSubtarget &ST = MF.getSubtarget<GCNSubtarget>();
   const SIInstrInfo *TII = ST.getInstrInfo();
   TRI = ST.getRegisterInfo();
