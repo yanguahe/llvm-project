@@ -148,8 +148,13 @@ protected:
   bool tryCandidate(SchedCandidate &Cand, SchedCandidate &TryCand,
                     SchedBoundary *Zone) const override;
 
+  mutable bool TopMFMAMomentum = false;
+  mutable bool BotMFMAMomentum = false;
+
 public:
   GCNMaxILPSchedStrategy(const MachineSchedContext *C);
+
+  void schedNode(SUnit *SU, bool IsTopNode) override;
 };
 
 /// The goal of this scheduling strategy is to maximize memory clause for a

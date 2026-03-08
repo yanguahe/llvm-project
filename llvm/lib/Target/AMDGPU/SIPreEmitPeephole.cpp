@@ -14,6 +14,8 @@
 #include "AMDGPU.h"
 #include "GCNSubtarget.h"
 #include "MCTargetDesc/AMDGPUMCTargetDesc.h"
+#include "SIInstrInfo.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/TargetSchedule.h"
 #include "llvm/Support/BranchProbability.h"
@@ -21,6 +23,8 @@
 using namespace llvm;
 
 #define DEBUG_TYPE "si-pre-emit-peephole"
+
+static constexpr bool SinkVALUPastMFMA = true;
 
 namespace {
 
@@ -39,6 +43,7 @@ private:
                              const MachineBasicBlock &From,
                              const MachineBasicBlock &To) const;
   bool removeExeczBranch(MachineInstr &MI, MachineBasicBlock &SrcMBB);
+  bool sinkVALUPastMFMAChains(MachineBasicBlock &MBB) const;
 
 public:
   bool run(MachineFunction &MF);
@@ -426,6 +431,150 @@ llvm::SIPreEmitPeepholePass::run(MachineFunction &MF,
   return getMachineFunctionPassPreservedAnalyses();
 }
 
+bool SIPreEmitPeephole::sinkVALUPastMFMAChains(MachineBasicBlock &MBB) const {
+  bool Modified = false;
+
+  SmallVector<MachineInstr *, 64> MFMAs;
+  for (MachineInstr &MI : MBB) {
+    if (SIInstrInfo::isMAI(MI))
+      MFMAs.push_back(&MI);
+  }
+  if (MFMAs.size() < 2)
+    return false;
+
+  bool DidSink = true;
+  int Iters = 0;
+  while (DidSink && Iters < 20) {
+    DidSink = false;
+    Iters++;
+
+    for (int i = (int)MFMAs.size() - 2; i >= 0; i--) {
+      MachineInstr *CurMFMA = MFMAs[i];
+      MachineInstr *NextMFMA = MFMAs[i + 1];
+
+      SmallVector<MachineInstr *, 16> Candidates;
+      for (auto It = std::next(MachineBasicBlock::iterator(CurMFMA));
+           &*It != NextMFMA; ++It) {
+        if (SIInstrInfo::isVALU(*It) && !It->isTerminator())
+          Candidates.push_back(&*It);
+      }
+      if (Candidates.empty())
+        continue;
+
+      int ChainEnd = i + 1;
+      while (ChainEnd + 1 < (int)MFMAs.size()) {
+        bool HasVALU = false;
+        for (auto It = std::next(MachineBasicBlock::iterator(MFMAs[ChainEnd]));
+             &*It != MFMAs[ChainEnd + 1]; ++It) {
+          if (SIInstrInfo::isVALU(*It)) {
+            HasVALU = true;
+            break;
+          }
+        }
+        if (HasVALU)
+          break;
+        ChainEnd++;
+      }
+
+      DenseSet<unsigned> ChainUseUnits, ChainDefUnits;
+      for (int j = i + 1; j <= ChainEnd; j++) {
+        for (const MachineOperand &MO : MFMAs[j]->operands()) {
+          if (!MO.isReg() || !MO.getReg().isPhysical())
+            continue;
+          for (MCRegUnit U : TRI->regunits(MO.getReg())) {
+            if (MO.isUse())
+              ChainUseUnits.insert(U);
+            if (MO.isDef())
+              ChainDefUnits.insert(U);
+          }
+        }
+      }
+
+      auto SinkTarget =
+          std::next(MachineBasicBlock::iterator(MFMAs[ChainEnd]));
+
+      for (MachineInstr *VALU : Candidates) {
+        DenseSet<unsigned> VDefUnits, VUseUnits;
+        for (const MachineOperand &MO : VALU->operands()) {
+          if (!MO.isReg() || !MO.getReg().isPhysical())
+            continue;
+          for (MCRegUnit U : TRI->regunits(MO.getReg())) {
+            if (MO.isDef())
+              VDefUnits.insert(U);
+            if (MO.isUse())
+              VUseUnits.insert(U);
+          }
+        }
+
+        // VALU defs must not overlap chain uses (would change MFMA inputs).
+        bool Safe = true;
+        for (unsigned U : VDefUnits) {
+          if (ChainUseUnits.count(U)) {
+            Safe = false;
+            break;
+          }
+        }
+        if (!Safe)
+          continue;
+
+        // VALU uses must not overlap chain defs.
+        for (unsigned U : VUseUnits) {
+          if (ChainDefUnits.count(U)) {
+            Safe = false;
+            break;
+          }
+        }
+        if (!Safe)
+          continue;
+
+        // No instruction between VALU and SinkTarget defines VALU's uses.
+        for (auto It = std::next(MachineBasicBlock::iterator(VALU));
+             It != SinkTarget && Safe; ++It) {
+          for (const MachineOperand &MO : It->operands()) {
+            if (MO.isReg() && MO.isDef() && MO.getReg().isPhysical()) {
+              for (MCRegUnit U : TRI->regunits(MO.getReg())) {
+                if (VUseUnits.count(U)) {
+                  Safe = false;
+                  break;
+                }
+              }
+            }
+            if (!Safe)
+              break;
+          }
+        }
+        if (!Safe)
+          continue;
+
+        // No instruction between VALU and SinkTarget reads VALU's defs.
+        for (auto It = std::next(MachineBasicBlock::iterator(VALU));
+             It != SinkTarget && Safe; ++It) {
+          for (const MachineOperand &MO : It->operands()) {
+            if (MO.isReg() && MO.isUse() && MO.getReg().isPhysical()) {
+              for (MCRegUnit U : TRI->regunits(MO.getReg())) {
+                if (VDefUnits.count(U)) {
+                  Safe = false;
+                  break;
+                }
+              }
+            }
+            if (!Safe)
+              break;
+          }
+        }
+        if (!Safe)
+          continue;
+
+        MBB.splice(SinkTarget, &MBB, VALU);
+        Modified = true;
+        DidSink = true;
+      }
+    }
+  }
+
+  return Modified;
+}
+
 bool SIPreEmitPeephole::run(MachineFunction &MF) {
   const GCNSubtarget &ST = MF.getSubtarget<GCNSubtarget>();
   TII = ST.getInstrInfo();
@@ -435,6 +584,9 @@ bool SIPreEmitPeephole::run(MachineFunction &MF) {
   MF.RenumberBlocks();
 
   for (MachineBasicBlock &MBB : MF) {
+    if (SinkVALUPastMFMA)
+      Changed |= sinkVALUPastMFMAChains(MBB);
+
     MachineBasicBlock::iterator TermI = MBB.getFirstTerminator();
     // Check first terminator for branches to optimize
     if (TermI != MBB.end()) {

@@ -474,7 +474,7 @@ static std::string processOneLoop(std::string loop,
     loop.insert(barrierWaitLineStart, insertBlock);
   }
 
-  // --- Pass 2: Insert yield NOPs after the LAST s_setprio 0 ---
+  // --- Pass 2: Insert yield NOPs after the LAST s_setprio 0 (before barrier) ---
   unsigned yieldInserted = 0;
   size_t setprio0 = insertYield ? loop.rfind("s_setprio 0") : std::string::npos;
   if (setprio0 != std::string::npos) {
@@ -522,9 +522,146 @@ static std::string processOneLoop(std::string loop,
     }
   }
 
+  unsigned vmcntRelaxed = 0;
+
+  // --- Pass 4a: Remove redundant vmcnt(0) in V staging ---
+  // Pattern: vmcnt(0) ... [no buffer/global loads] ... vmcnt(0)
+  // The second vmcnt(0) is redundant since no new VMEM ops were issued.
+  {
+    size_t first = loop.find("s_waitcnt vmcnt(0)\n");
+    if (first == std::string::npos)
+      first = loop.find("s_waitcnt vmcnt(0)");
+    if (first != std::string::npos) {
+      size_t firstEnd = loop.find('\n', first);
+      if (firstEnd != std::string::npos) {
+        firstEnd++;
+        // Find next standalone vmcnt(0) (not part of a FULL wait)
+        size_t pos2 = firstEnd;
+        while (true) {
+          size_t second = loop.find("s_waitcnt vmcnt(0)", pos2);
+          if (second == std::string::npos) break;
+          // Make sure it's standalone vmcnt(0), not part of FULL wait
+          std::string restOfLine = loop.substr(second, 60);
+          if (restOfLine.find("expcnt") != std::string::npos) {
+            pos2 = second + 20;
+            continue;
+          }
+          // Check no VMEM ops between first and second
+          std::string between = loop.substr(firstEnd, second - firstEnd);
+          if (between.find("buffer_load") == std::string::npos &&
+              between.find("global_load") == std::string::npos) {
+            size_t secLineStart = loop.rfind('\n', second);
+            secLineStart = (secLineStart == std::string::npos) ? 0 : secLineStart + 1;
+            size_t secLineEnd = loop.find('\n', second);
+            secLineEnd = (secLineEnd == std::string::npos) ? loop.size() : secLineEnd + 1;
+            loop.erase(secLineStart, secLineEnd - secLineStart);
+            vmcntRelaxed++;
+            llvm::errs() << "[postProcessISA] Removed redundant vmcnt(0) in "
+                         << label << "\n";
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  // --- Pass 4b: Replace pre-GEMM1 FULL wait with s_nop 0 ---
+  // DISABLED: removing/replacing this fence causes ~1.5T regression.
+  if (false) {
+    const std::string fullWait = "s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)";
+    size_t pos = 0;
+    while (true) {
+      size_t fw = loop.find(fullWait, pos);
+      if (fw == std::string::npos) break;
+      size_t fwEnd = loop.find('\n', fw);
+      if (fwEnd == std::string::npos) { pos = fw + 1; continue; }
+      fwEnd++;
+      // Check if followed by v_mfma within 100 chars
+      std::string afterChunk = loop.substr(fwEnd,
+          std::min((size_t)100, loop.size() - fwEnd));
+      if (afterChunk.find("v_mfma") != std::string::npos) {
+        // Check if preceded by lgkmcnt(0) with no memory ops between
+        size_t fwLineStart = loop.rfind('\n', fw);
+        fwLineStart = (fwLineStart == std::string::npos) ? 0 : fwLineStart + 1;
+        size_t lookbackStart = (fwLineStart > 400) ? fwLineStart - 400 : 0;
+        std::string before = loop.substr(lookbackStart, fwLineStart - lookbackStart);
+        size_t lgkm0 = before.rfind("s_waitcnt lgkmcnt(0)");
+        if (lgkm0 != std::string::npos) {
+          std::string gap = before.substr(lgkm0);
+          if (gap.find("buffer_load") == std::string::npos &&
+              gap.find("global_load") == std::string::npos &&
+              gap.find("ds_read") == std::string::npos &&
+              gap.find("ds_write") == std::string::npos &&
+              gap.find("ds_permute") == std::string::npos) {
+            loop.replace(fw, fullWait.size(), "s_nop 0");
+            vmcntRelaxed++;
+            llvm::errs() << "[postProcessISA] Replaced pre-GEMM1 FULL wait"
+                         << " with s_nop in " << label << "\n";
+            pos = fw + 6;
+            continue;
+          }
+        }
+      }
+      pos = fw + 1;
+    }
+  }
+
+  // --- Pass 5: Remove useless s_setprio 1 immediately followed by s_setprio 0 ---
+  // Currently disabled: removing the pair causes slight regression.
+  unsigned setprioRemoved = 0;
+  if (false) {
+    const std::string sp1 = "s_setprio 1";
+    const std::string sp0 = "s_setprio 0";
+    size_t pos = 0;
+    while (true) {
+      size_t p1 = loop.find(sp1, pos);
+      if (p1 == std::string::npos) break;
+      size_t p1End = loop.find('\n', p1);
+      if (p1End == std::string::npos) { pos = p1 + 1; continue; }
+      p1End++;
+      // Skip whitespace/ASMEND lines to find next meaningful instruction
+      std::string after = loop.substr(p1End, std::min((size_t)200, loop.size() - p1End));
+      // Look for s_setprio 0 within 4 lines (may have ;;#ASMEND/ASMSTART between)
+      size_t p0 = after.find(sp0);
+      if (p0 != std::string::npos && p0 < 160) {
+        // Check nothing meaningful between them (only ASM markers, whitespace)
+        std::string between = after.substr(0, p0);
+        bool onlyMarkers = true;
+        for (const auto &ch : between) {
+          if (ch != '\n' && ch != '\t' && ch != ' ' && ch != ';' && ch != '#' &&
+              ch != 'A' && ch != 'S' && ch != 'M' && ch != 'E' && ch != 'N' &&
+              ch != 'D' && ch != 'T' && ch != 'R') {
+            onlyMarkers = false;
+            break;
+          }
+        }
+        if (onlyMarkers) {
+          // Remove both s_setprio 1 line and s_setprio 0 line
+          size_t p1LineStart = loop.rfind('\n', p1);
+          if (p1LineStart == std::string::npos) p1LineStart = 0;
+          else p1LineStart++;
+          size_t p0Abs = p1End + p0;
+          size_t p0End = loop.find('\n', p0Abs);
+          if (p0End == std::string::npos) p0End = loop.size();
+          else p0End++;
+          // Remove from p1LineStart to p0End
+          loop.erase(p1LineStart, p0End - p1LineStart);
+          setprioRemoved++;
+          llvm::errs() << "[postProcessISA] Removed useless s_setprio 1->0 pair in "
+                       << label << "\n";
+          pos = p1LineStart;
+          continue;
+        }
+      }
+      pos = p1 + 1;
+    }
+  }
+
   llvm::errs() << "[postProcessISA] " << label << ": moved " << cmpMoved
                << " v_cmp, yield=" << yieldInserted
-               << ", nopFilled=" << nopFilled << "\n";
+               << ", nopFilled=" << nopFilled
+               << ", vmcntRelaxed=" << vmcntRelaxed
+               << ", setprioRemoved=" << setprioRemoved << "\n";
 
   return loop;
 }
@@ -568,8 +705,86 @@ static std::string postProcessISA(const std::string &isa) {
 
     bool doYield = false;
     bool fillGap = false;
-    bool hoistVcmp = true;
+    bool hoistVcmp = false;
     loop = processOneLoop(std::move(loop), label, doYield, fillGap, hoistVcmp);
+
+    // Pass 7: Move s_setprio around O rescale v_pk_mul block.
+    // Compiler places s_setprio AFTER v_pk_mul; we move it BEFORE.
+    {
+      size_t lastPkMul = loop.rfind("v_pk_mul_f32");
+      if (lastPkMul != std::string::npos) {
+        // Find end of last v_pk_mul line
+        size_t lastPkMulLineEnd = loop.find('\n', lastPkMul);
+        if (lastPkMulLineEnd == std::string::npos)
+          lastPkMulLineEnd = loop.size();
+        else
+          lastPkMulLineEnd++;
+
+        // Scan backward to find the start of contiguous v_pk_mul block
+        size_t blockStart = loop.rfind('\n', lastPkMul);
+        if (blockStart == std::string::npos) blockStart = 0;
+        else blockStart++;
+
+        unsigned pkMulCount = 1;
+        size_t scanPos = blockStart;
+        while (scanPos > 0) {
+          size_t prevLineEnd = scanPos - 1;
+          size_t prevLineStart = loop.rfind('\n', prevLineEnd - 1);
+          if (prevLineStart == std::string::npos) prevLineStart = 0;
+          else prevLineStart++;
+          std::string prevLine = loop.substr(prevLineStart,
+                                             prevLineEnd - prevLineStart);
+          if (prevLine.find("v_pk_mul_f32") != std::string::npos) {
+            blockStart = prevLineStart;
+            pkMulCount++;
+            scanPos = prevLineStart;
+          } else {
+            break;
+          }
+        }
+
+        if (pkMulCount >= 999) {
+          // Look for s_setprio 1 / s_setprio 0 pair after the block
+          std::string afterBlock = loop.substr(lastPkMulLineEnd,
+              std::min((size_t)300, loop.size() - lastPkMulLineEnd));
+          size_t sp1Off = afterBlock.find("s_setprio 1");
+          size_t sp0Off = (sp1Off != std::string::npos)
+                              ? afterBlock.find("s_setprio 0", sp1Off)
+                              : std::string::npos;
+
+          if (sp1Off != std::string::npos && sp0Off != std::string::npos
+              && sp0Off < 200) {
+            // Remove the pair (both lines)
+            size_t sp1Abs = lastPkMulLineEnd + sp1Off;
+            size_t sp1LineStart = loop.rfind('\n', sp1Abs);
+            sp1LineStart = (sp1LineStart == std::string::npos) ? sp1Abs
+                                                               : sp1LineStart + 1;
+            size_t sp0Abs = lastPkMulLineEnd + sp0Off;
+            size_t sp0LineEnd = loop.find('\n', sp0Abs);
+            sp0LineEnd = (sp0LineEnd == std::string::npos) ? loop.size()
+                                                           : sp0LineEnd + 1;
+            loop.erase(sp1LineStart, sp0LineEnd - sp1LineStart);
+
+            // Recalculate lastPkMulLineEnd after erasure
+            lastPkMul = loop.rfind("v_pk_mul_f32");
+            if (lastPkMul != std::string::npos) {
+              lastPkMulLineEnd = loop.find('\n', lastPkMul);
+              if (lastPkMulLineEnd != std::string::npos) lastPkMulLineEnd++;
+              else lastPkMulLineEnd = loop.size();
+            }
+
+            // Insert s_setprio 0 after block
+            loop.insert(lastPkMulLineEnd, "\ts_setprio 0\n");
+            // Insert s_setprio 1 before block
+            loop.insert(blockStart, "\ts_setprio 1\n");
+
+            llvm::errs() << "[postProcessISA] Moved s_setprio around "
+                         << pkMulCount << " v_pk_mul in " << label << "\n";
+          }
+        }
+      }
+    }
+
     result = before + loop + after;
   }
 

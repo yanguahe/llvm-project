@@ -75,6 +75,13 @@ static cl::opt<bool> ClusterMFMA(
              "windows. Beneficial on targets where MFMA+VALU cannot overlap."),
     cl::init(false));
 
+static cl::opt<bool> MFMAMomentum(
+    "amdgpu-mfma-momentum", cl::Hidden,
+    cl::desc("When the last scheduled instruction was MFMA, prefer scheduling "
+             "another MFMA next to build deeper chains. Lighter than "
+             "cluster-mfma: only chains when momentum exists."),
+    cl::init(false));
+
 const unsigned ScheduleMetrics::ScaleFactor = 100;
 
 GCNSchedStrategy::GCNSchedStrategy(const MachineSchedContext *C)
@@ -546,6 +553,17 @@ GCNMaxILPSchedStrategy::GCNMaxILPSchedStrategy(const MachineSchedContext *C)
   SchedStages.push_back(GCNSchedStageID::ILPInitialSchedule);
 }
 
+void GCNMaxILPSchedStrategy::schedNode(SUnit *SU, bool IsTopNode) {
+  GCNSchedStrategy::schedNode(SU, IsTopNode);
+  if (MFMAMomentum && SU->getInstr()) {
+    bool IsMFMA = SIInstrInfo::isMAI(*SU->getInstr());
+    if (IsTopNode)
+      TopMFMAMomentum = IsMFMA;
+    else
+      BotMFMAMomentum = IsMFMA;
+  }
+}
+
 bool GCNMaxILPSchedStrategy::tryCandidate(SchedCandidate &Cand,
                                           SchedCandidate &TryCand,
                                           SchedBoundary *Zone) const {
@@ -553,6 +571,26 @@ bool GCNMaxILPSchedStrategy::tryCandidate(SchedCandidate &Cand,
   if (!Cand.isValid()) {
     TryCand.Reason = NodeOrder;
     return true;
+  }
+
+  // MFMA momentum (high priority): on GFX942, MFMA→VALU transitions cost ~28
+  // cycles due to shared issue port. When the last scheduled instruction was
+  // MFMA, unconditionally prefer another MFMA to build deeper chains.
+  if (MFMAMomentum && Zone) {
+    bool HasMomentum = Zone->isTop() ? TopMFMAMomentum : BotMFMAMomentum;
+    if (HasMomentum) {
+      bool TryIsMFMA = TryCand.SU && TryCand.SU->getInstr() &&
+                       SIInstrInfo::isMAI(*TryCand.SU->getInstr());
+      bool CandIsMFMA = Cand.SU && Cand.SU->getInstr() &&
+                        SIInstrInfo::isMAI(*Cand.SU->getInstr());
+      if (TryIsMFMA && !CandIsMFMA) {
+        TryCand.Reason = Cluster;
+        return true;
+      }
+      if (!TryIsMFMA && CandIsMFMA) {
+        return false;
+      }
+    }
   }
 
   // Avoid spilling by exceeding the register limit.

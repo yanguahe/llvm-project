@@ -64,6 +64,13 @@ static cl::opt<bool>
                              "before DS operations when alias info is absent"),
                     cl::init(false), cl::Hidden);
 
+static cl::opt<bool>
+    SkipLDSDMADsCnt("amdgpu-skip-lds-dma-dscnt",
+                    cl::desc("Skip DS_CNT (lgkmcnt) tracking for LDS DMA "
+                             "(buffer_load_lds) so ds_read waits are not "
+                             "inflated by pending DMA operations"),
+                    cl::init(false), cl::Hidden);
+
 static cl::opt<bool> ForceEmitZeroLoadFlag(
     "amdgpu-waitcnt-load-forcezero",
     cl::desc("Force all waitcnt load counters to wait until 0"),
@@ -74,12 +81,15 @@ static cl::opt<bool> CoalesceDsWaitcnt(
     cl::desc("Coalesce DS_CNT ladder waits: when a non-zero DS_CNT wait is "
              "needed, force it to 0 so subsequent consumers see all reads as "
              "complete, eliminating per-pair lgkmcnt instructions"),
-    cl::init(false), cl::Hidden);
+    cl::init(true), cl::Hidden);
 
-static cl::opt<bool> TrustBarrierWaitcnt(
-    "amdgpu-trust-barrier-waitcnt",
-    cl::desc("Trust explicit S_WAITCNT before S_BARRIER instead of forcing "
-             "all counters to zero. Use when user code places targeted waits."),
+// Hardcoded to true: trust explicit S_WAITCNT before S_BARRIER instead of
+// forcing all counters to zero. The FlyDSL frontend places targeted waits.
+static constexpr bool TrustBarrierWaitcnt = true;
+
+static cl::opt<bool> DebugDsCntWait(
+    "amdgpu-debug-ds-cnt-wait",
+    cl::desc("Print debug info when DS_CNT wait is generated"),
     cl::init(false), cl::Hidden);
 
 namespace {
@@ -1061,6 +1071,7 @@ void WaitcntBrackets::updateByEvent(const SIInstrInfo *TII,
         (TII->isDS(Inst) || TII->mayWriteLDSThroughDMA(Inst))) {
       // MUBUF and FLAT LDS DMA operations need a wait on vmcnt before LDS
       // written can be accessed. A load from LDS to VMEM does not need a wait.
+      bool IsDMA = TII->mayWriteLDSThroughDMA(Inst);
       unsigned Slot = 0;
       for (const auto *MemOp : Inst.memoperands()) {
         if (!MemOp->isStore() ||
@@ -1092,9 +1103,11 @@ void WaitcntBrackets::updateByEvent(const SIInstrInfo *TII,
         Slot = LDSDMAStores.size();
         break;
       }
-      setRegScore(FIRST_LDS_VGPR + Slot, T, CurrScore);
-      if (Slot)
-        setRegScore(FIRST_LDS_VGPR, T, CurrScore);
+      if (!(SkipLDSDMADsCnt && IsDMA)) {
+        setRegScore(FIRST_LDS_VGPR + Slot, T, CurrScore);
+        if (Slot)
+          setRegScore(FIRST_LDS_VGPR, T, CurrScore);
+      }
     }
   }
 }
@@ -1218,18 +1231,10 @@ void WaitcntBrackets::determineWait(InstCounterType T, RegInterval Interval,
     if ((UB >= ScoreToWait) && (ScoreToWait > LB)) {
       if ((T == LOAD_CNT || T == DS_CNT) && hasPendingFlat() &&
           !Context->ST->hasFlatLgkmVMemCountInOrder()) {
-        // If there is a pending FLAT operation, and this is a VMem or LGKM
-        // waitcnt and the target can report early completion, then we need
-        // to force a waitcnt 0.
         addWait(Wait, T, 0);
       } else if (counterOutOfOrder(T)) {
-        // Counter can get decremented out-of-order when there
-        // are multiple types event in the bracket. Also emit an s_wait counter
-        // with a conservative value of 0 for the counter.
         addWait(Wait, T, 0);
       } else {
-        // If a counter has been maxed out avoid overflow by waiting for
-        // MAX(CounterType) - 1 instead.
         unsigned NeededWait =
             std::min(UB - ScoreToWait, Context->getWaitCountMax(T) - 1);
         addWait(Wait, T, NeededWait);
@@ -2021,7 +2026,20 @@ bool SIInsertWaitcnts::generateWaitcntInstBefore(MachineInstr &MI,
           if (Op.isDef() || ScoreBrackets.hasPendingEvent(EXP_LDS_ACCESS)) {
             ScoreBrackets.determineWait(EXP_CNT, Interval, Wait);
           }
-          ScoreBrackets.determineWait(DS_CNT, Interval, Wait);
+          {
+            AMDGPU::Waitcnt OldWait = Wait;
+            ScoreBrackets.determineWait(DS_CNT, Interval, Wait);
+            if (DebugDsCntWait && Wait.DsCnt != OldWait.DsCnt) {
+              llvm::errs() << "[DS_CNT] BB#"
+                           << MI.getParent()->getNumber()
+                           << " DsCnt:" << OldWait.DsCnt << "->"
+                           << Wait.DsCnt
+                           << " reg:[" << Interval.first << ","
+                           << Interval.second << ")"
+                           << (Op.isDef() ? " DEF" : " USE")
+                           << " MI:" << MI;
+            }
+          }
         } else {
           ScoreBrackets.determineWait(SmemAccessCounter, Interval, Wait);
         }

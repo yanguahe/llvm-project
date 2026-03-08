@@ -642,11 +642,25 @@ createGCNMaxOccupancyMachineScheduler(MachineSchedContext *C) {
   return DAG;
 }
 
+static cl::opt<bool> SeparateMFMAVALU(
+    "amdgpu-separate-mfma-valu", cl::Hidden,
+    cl::desc("Add DAG edges to batch MFMA away from VALU on MI308X"),
+    cl::init(false));
+
+namespace {
+class SeparateMFMAVALUMutation : public ScheduleDAGMutation {
+public:
+  void apply(ScheduleDAGInstrs *DAG) override;
+};
+} // anonymous namespace
+
 static ScheduleDAGInstrs *
 createGCNMaxILPMachineScheduler(MachineSchedContext *C) {
   ScheduleDAGMILive *DAG =
       new GCNScheduleDAGMILive(C, std::make_unique<GCNMaxILPSchedStrategy>(C));
   DAG->addMutation(createIGroupLPDAGMutation(AMDGPU::SchedulingPhase::Initial));
+  if (SeparateMFMAVALU)
+    DAG->addMutation(std::make_unique<SeparateMFMAVALUMutation>());
   return DAG;
 }
 
@@ -1227,36 +1241,34 @@ GCNTargetMachine::createMachineScheduler(MachineSchedContext *C) const {
   return createGCNMaxOccupancyMachineScheduler(C);
 }
 
-static cl::opt<bool> SeparateMFMAVALU(
-    "amdgpu-separate-mfma-valu", cl::Hidden,
-    cl::desc("Add post-RA DAG edges to batch MFMA away from VALU on MI308X"),
-    cl::init(false));
+static bool isMaskVALU(const MachineInstr &MI) {
+  if (SIInstrInfo::isVOPC(MI))
+    return true;
+  unsigned Opc = MI.getOpcode();
+  return Opc == AMDGPU::V_CNDMASK_B32_e32 ||
+         Opc == AMDGPU::V_CNDMASK_B32_e64;
+}
 
-namespace {
-
-class SeparateMFMAVALUMutation : public ScheduleDAGMutation {
-public:
-  void apply(ScheduleDAGInstrs *DAG) override {
+void SeparateMFMAVALUMutation::apply(ScheduleDAGInstrs *DAG) {
     const unsigned NumSUnits = DAG->SUnits.size();
     if (NumSUnits == 0)
       return;
 
     SmallVector<SUnit *, 32> MFMAs;
-    SmallVector<SUnit *, 64> VALUs;
+    SmallVector<SUnit *, 32> MaskVALUs;
 
     for (SUnit &SU : DAG->SUnits) {
       if (!SU.getInstr())
         continue;
       if (SIInstrInfo::isMFMA(*SU.getInstr()))
         MFMAs.push_back(&SU);
-      else if (SIInstrInfo::isVALU(*SU.getInstr()))
-        VALUs.push_back(&SU);
+      else if (isMaskVALU(*SU.getInstr()))
+        MaskVALUs.push_back(&SU);
     }
 
-    if (MFMAs.empty() || VALUs.empty())
+    if (MFMAs.empty() || MaskVALUs.empty())
       return;
 
-    // Use a BitVector for reachability (safe, no sentinel issues).
     BitVector Reachable(NumSUnits);
 
     std::function<void(SUnit *)> CollectSuccs = [&](SUnit *SU) {
@@ -1269,18 +1281,18 @@ public:
       }
     };
 
-    for (SUnit *MFMA : MFMAs) {
+    for (SUnit *MV : MaskVALUs) {
       Reachable.reset();
-      Reachable.set(MFMA->NodeNum);
-      CollectSuccs(MFMA);
+      Reachable.set(MV->NodeNum);
+      CollectSuccs(MV);
 
-      for (SUnit *VALU : VALUs) {
-        if (Reachable.test(VALU->NodeNum))
+      for (SUnit *MFMA : MFMAs) {
+        if (Reachable.test(MFMA->NodeNum))
           continue;
 
         bool AlreadyPred = false;
-        for (const SDep &Pred : MFMA->Preds) {
-          if (Pred.getSUnit() == VALU) {
+        for (const SDep &Pred : MV->Preds) {
+          if (Pred.getSUnit() == MFMA) {
             AlreadyPred = true;
             break;
           }
@@ -1288,15 +1300,12 @@ public:
         if (AlreadyPred)
           continue;
 
-        SDep Dep(VALU, SDep::Artificial);
+        SDep Dep(MFMA, SDep::Artificial);
         Dep.setLatency(0);
-        MFMA->addPred(Dep);
+        MV->addPred(Dep);
       }
     }
-  }
-};
-
-} // anonymous namespace
+}
 
 ScheduleDAGInstrs *
 GCNTargetMachine::createPostMachineScheduler(MachineSchedContext *C) const {
