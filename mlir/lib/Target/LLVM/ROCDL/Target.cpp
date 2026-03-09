@@ -789,6 +789,385 @@ static std::string processOneLoop(std::string loop,
   return loop;
 }
 
+// Restructure GEMM2 MFMAs from column-cycling [1,1,...,1] to accumulator-grouped
+// [4,4,4,4]. Each group of 4 MFMAs uses the same SrcC (accumulator) register,
+// enabling back-to-back same-SrcC pipelining and better memory-compute overlap.
+static std::string restructureGEMM2(std::string loop,
+                                    const std::string &label) {
+  auto extractVGPRRange = [](const std::string &s,
+                             size_t startFrom) -> std::string {
+    size_t pos = s.find("v[", startFrom);
+    if (pos == std::string::npos)
+      return "";
+    size_t end = s.find(']', pos);
+    if (end == std::string::npos)
+      return "";
+    return s.substr(pos, end - pos + 1);
+  };
+
+  size_t searchPos = 0;
+  int bodiesProcessed = 0;
+
+  while (true) {
+    size_t sp0 = loop.find("s_setprio 0", searchPos);
+    if (sp0 == std::string::npos)
+      break;
+    size_t sp0LineEnd = loop.find('\n', sp0);
+    if (sp0LineEnd == std::string::npos)
+      break;
+    sp0LineEnd++;
+
+    size_t endMarker = loop.find("v_pk_mul_f32", sp0LineEnd);
+    size_t nextBarrier = loop.find("s_barrier", sp0LineEnd);
+    if (endMarker == std::string::npos && nextBarrier == std::string::npos) {
+      searchPos = sp0LineEnd;
+      continue;
+    }
+    if (endMarker == std::string::npos ||
+        (nextBarrier != std::string::npos && nextBarrier < endMarker))
+      endMarker = nextBarrier;
+
+    size_t endLineStart = loop.rfind('\n', endMarker);
+    if (endLineStart == std::string::npos)
+      endLineStart = 0;
+    else
+      endLineStart++;
+
+    std::string region = loop.substr(sp0LineEnd, endLineStart - sp0LineEnd);
+
+    // Split region into lines, tracking positions
+    struct LineInfo {
+      std::string text;
+      size_t posInRegion;
+    };
+    std::vector<LineInfo> lines;
+    {
+      size_t pos = 0;
+      while (pos < region.size()) {
+        size_t eol = region.find('\n', pos);
+        if (eol == std::string::npos) {
+          if (pos < region.size())
+            lines.push_back({region.substr(pos), pos});
+          break;
+        }
+        lines.push_back({region.substr(pos, eol - pos + 1), pos});
+        pos = eol + 1;
+      }
+    }
+
+    // Collect MFMAs and ds_reads with their line indices
+    struct MFMAEntry {
+      int lineIdx;
+      std::string dest, srcA, srcB;
+    };
+    struct DSReadEntry {
+      int lineIdx;
+      std::string dest;
+      int offset;
+    };
+
+    std::vector<MFMAEntry> mfmas;
+    std::vector<DSReadEntry> dsReads;
+
+    for (int i = 0; i < (int)lines.size(); i++) {
+      std::string stripped = lines[i].text;
+      size_t cpos = stripped.find("//");
+      if (cpos != std::string::npos)
+        stripped = stripped.substr(0, cpos);
+
+      if (stripped.find("v_mfma_f32_32x32x8_bf16") != std::string::npos) {
+        MFMAEntry m;
+        m.lineIdx = i;
+        m.dest = extractVGPRRange(stripped, 0);
+        size_t after1 = stripped.find(']') + 1;
+        m.srcA = extractVGPRRange(stripped, after1);
+        size_t after2 =
+            stripped.find(']', stripped.find("v[", after1)) + 1;
+        m.srcB = extractVGPRRange(stripped, after2);
+        if (!m.dest.empty() && !m.srcA.empty() && !m.srcB.empty())
+          mfmas.push_back(m);
+      } else if (stripped.find("ds_read_b64") != std::string::npos) {
+        DSReadEntry d;
+        d.lineIdx = i;
+        d.dest = extractVGPRRange(stripped, 0);
+        size_t offPos = stripped.find("offset:");
+        d.offset = (offPos != std::string::npos)
+                       ? std::stoi(stripped.substr(offPos + 7))
+                       : -1;
+        dsReads.push_back(d);
+      }
+    }
+
+    if (mfmas.size() != 16 || dsReads.size() < 16) {
+      searchPos = endLineStart;
+      continue;
+    }
+
+    // Build accOrder and verify 4 groups of 4
+    std::vector<std::string> accOrder;
+    std::map<std::string, int> accCount;
+    for (auto &m : mfmas) {
+      accCount[m.dest]++;
+      if (std::find(accOrder.begin(), accOrder.end(), m.dest) ==
+          accOrder.end())
+        accOrder.push_back(m.dest);
+    }
+    if (accOrder.size() != 4) {
+      searchPos = endLineStart;
+      continue;
+    }
+    bool valid = true;
+    for (auto &a : accOrder)
+      if (accCount[a] != 4)
+        valid = false;
+    if (!valid) {
+      searchPos = endLineStart;
+      continue;
+    }
+
+    // Determine SrcB registers from the 4 unique SrcB values used by acc0
+    std::vector<std::string> srcBRegs;
+    for (auto &m : mfmas) {
+      if (m.dest == accOrder[0]) {
+        srcBRegs.push_back(m.srcB);
+      }
+    }
+    if (srcBRegs.size() != 4) {
+      searchPos = endLineStart;
+      continue;
+    }
+
+    // Verify all acc groups use the same SrcB order
+    for (size_t ai = 1; ai < 4 && valid; ai++) {
+      int ci = 0;
+      for (auto &m : mfmas) {
+        if (m.dest == accOrder[ai]) {
+          if (m.srcB != srcBRegs[ci]) {
+            valid = false;
+            break;
+          }
+          ci++;
+        }
+      }
+    }
+    if (!valid) {
+      searchPos = endLineStart;
+      continue;
+    }
+
+    // Determine original (accIdx, colIdx) for each MFMA position
+    struct Assignment {
+      int accIdx, colIdx;
+    };
+    std::vector<Assignment> origAssign(16);
+    {
+      std::map<std::string, int> accColCounter;
+      for (int j = 0; j < 16; j++) {
+        int ai = 0;
+        for (int k = 0; k < 4; k++)
+          if (mfmas[j].dest == accOrder[k])
+            ai = k;
+        int ci = accColCounter[mfmas[j].dest]++;
+        origAssign[j] = {ai, ci};
+      }
+    }
+
+    // Determine pBase and accStride from ds_reads
+    // Build feed_map: which ds_read feeds which MFMA
+    // Greedy: most recent ds_read to same register feeds the next MFMA using it
+    std::vector<int> feedMap(16, -1); // feedMap[dsread_idx] = mfma_idx
+    {
+      // Interleave: walk through lines in order, track pending ds_reads
+      std::map<std::string, int> pendingDsRead; // dest_reg -> dsread_idx
+      int mfmaSeq = 0;
+      int dsReadSeq = 0;
+      for (int i = 0; i < (int)lines.size(); i++) {
+        if (dsReadSeq < 16 && dsReads[dsReadSeq].lineIdx == i) {
+          pendingDsRead[dsReads[dsReadSeq].dest] = dsReadSeq;
+          dsReadSeq++;
+        }
+        if (mfmaSeq < 16 && mfmas[mfmaSeq].lineIdx == i) {
+          auto it = pendingDsRead.find(mfmas[mfmaSeq].srcA);
+          if (it != pendingDsRead.end()) {
+            feedMap[it->second] = mfmaSeq;
+            pendingDsRead.erase(it);
+          }
+          mfmaSeq++;
+        }
+      }
+    }
+
+    // Verify all feedMap entries are assigned
+    for (int i = 0; i < 16; i++) {
+      if (feedMap[i] < 0) {
+        valid = false;
+        break;
+      }
+    }
+    if (!valid) {
+      searchPos = endLineStart;
+      continue;
+    }
+
+    // Build inverse feed map: invFeed[mfma_idx] = dsread_idx
+    std::vector<int> invFeed(16, -1);
+    for (int i = 0; i < 16; i++)
+      invFeed[feedMap[i]] = i;
+
+    // Compute pBase from the ds_read that feeds MFMA[0] (acc0, col0)
+    // pBase[col] = offset for (acc0, col)
+    int pBase[4];
+    for (int c = 0; c < 4; c++) {
+      // Find MFMA with origAssign = (0, c)
+      for (int j = 0; j < 16; j++) {
+        if (origAssign[j].accIdx == 0 && origAssign[j].colIdx == c) {
+          pBase[c] = dsReads[invFeed[j]].offset;
+          break;
+        }
+      }
+    }
+
+    // Compute accStride
+    int accStride = 128;
+    {
+      // Find MFMA with origAssign = (1, 0) to get its ds_read offset
+      for (int j = 0; j < 16; j++) {
+        if (origAssign[j].accIdx == 1 && origAssign[j].colIdx == 0) {
+          int off = dsReads[invFeed[j]].offset;
+          int candidate = off - pBase[0];
+          if (candidate > 0 && candidate < 1024)
+            accStride = candidate;
+          break;
+        }
+      }
+    }
+
+    // New assignment: [4,4,4,4] accumulator grouping
+    // MFMA[j] -> new (group = j/4, col = j%4)
+    std::vector<Assignment> newAssign(16);
+    for (int j = 0; j < 16; j++)
+      newAssign[j] = {j / 4, j % 4};
+
+    // Log pre-modification state
+    llvm::errs() << "[restructureGEMM2] Body " << bodiesProcessed << " in "
+                 << label << "\n";
+    llvm::errs() << "  accOrder:";
+    for (auto &a : accOrder)
+      llvm::errs() << " " << a;
+    llvm::errs() << "\n  srcBRegs:";
+    for (auto &s : srcBRegs)
+      llvm::errs() << " " << s;
+    llvm::errs() << "\n  pBase=[" << pBase[0] << "," << pBase[1] << ","
+                 << pBase[2] << "," << pBase[3]
+                 << "] accStride=" << accStride << "\n";
+    llvm::errs() << "  feedMap:";
+    for (int i = 0; i < 16; i++)
+      llvm::errs() << " ds" << i << "->m" << feedMap[i];
+    llvm::errs() << "\n  origAssign:";
+    for (int j = 0; j < 16; j++)
+      llvm::errs() << " m" << j << "=(a" << origAssign[j].accIdx
+                   << ",c" << origAssign[j].colIdx << ")";
+    llvm::errs() << "\n";
+
+    // Verify offset formula for ALL 16 entries
+    bool offsetFormulaOK = true;
+    for (int j = 0; j < 16; j++) {
+      int dsIdx = invFeed[j];
+      int actualOff = dsReads[dsIdx].offset;
+      int expectedOff = pBase[origAssign[j].colIdx] +
+                        origAssign[j].accIdx * accStride;
+      if (actualOff != expectedOff) {
+        llvm::errs() << "  OFFSET MISMATCH: m" << j << " orig=(a"
+                     << origAssign[j].accIdx << ",c" << origAssign[j].colIdx
+                     << ") expected=" << expectedOff
+                     << " actual=" << actualOff << "\n";
+        offsetFormulaOK = false;
+      }
+    }
+    if (!offsetFormulaOK) {
+      llvm::errs() << "  SKIPPING body " << bodiesProcessed
+                   << " due to offset formula mismatch\n";
+      bodiesProcessed++;
+      searchPos = endLineStart;
+      continue;
+    }
+
+    // Apply in-place modifications: change MFMA operands and ds_read offsets
+    int modified = 0;
+    for (int j = 0; j < 16; j++) {
+      int newAcc = newAssign[j].accIdx;
+      int newCol = newAssign[j].colIdx;
+      std::string newAccReg = accOrder[newAcc];
+      std::string newSrcB = srcBRegs[newCol];
+      int newOffset = pBase[newCol] + newAcc * accStride;
+
+      int mfmaLine = mfmas[j].lineIdx;
+      std::string &mline = lines[mfmaLine].text;
+      std::string oldDest = mfmas[j].dest;
+      std::string oldSrcB = mfmas[j].srcB;
+
+      llvm::errs() << "  m" << j << ": (a" << origAssign[j].accIdx << ",c"
+                   << origAssign[j].colIdx << ")->(a" << newAcc << ",c"
+                   << newCol << ")";
+
+      if (oldDest != newAccReg || oldSrcB != newSrcB) {
+        std::string newInst = "\tv_mfma_f32_32x32x8_bf16 " + newAccReg +
+                              ", " + mfmas[j].srcA + ", " + newSrcB + ", " +
+                              newAccReg + "\n";
+        llvm::errs() << " MFMA: " << oldDest << "," << oldSrcB << " -> "
+                     << newAccReg << "," << newSrcB;
+        mline = newInst;
+        modified++;
+      }
+
+      int dsIdx = invFeed[j];
+      if (dsIdx >= 0) {
+        int dsLine = dsReads[dsIdx].lineIdx;
+        std::string &dline = lines[dsLine].text;
+        int oldOffset = dsReads[dsIdx].offset;
+        if (oldOffset != newOffset) {
+          std::string oldOffStr = "offset:" + std::to_string(oldOffset);
+          std::string newOffStr = "offset:" + std::to_string(newOffset);
+          size_t offPos = dline.find(oldOffStr);
+          if (offPos != std::string::npos) {
+            dline.replace(offPos, oldOffStr.size(), newOffStr);
+            llvm::errs() << " DS: " << oldOffset << "->" << newOffset;
+            modified++;
+          } else {
+            llvm::errs() << " DS: OFFSET NOT FOUND in line!";
+          }
+        }
+      }
+      llvm::errs() << "\n";
+    }
+
+    if (modified == 0) {
+      llvm::errs() << "  SKIPPING body " << bodiesProcessed
+                   << " (already grouped)\n";
+      bodiesProcessed++;
+      searchPos = endLineStart;
+      continue;
+    }
+
+    llvm::errs() << "  Total modified: " << modified << "\n";
+
+    // Reconstruct the region from modified lines
+    std::string newRegion;
+    for (auto &li : lines)
+      newRegion += li.text;
+
+    loop.replace(sp0LineEnd, endLineStart - sp0LineEnd, newRegion);
+    searchPos = sp0LineEnd + newRegion.size();
+    bodiesProcessed++;
+  }
+
+  if (bodiesProcessed > 0)
+    llvm::errs() << "[postProcessISA] restructureGEMM2: processed "
+                 << bodiesProcessed << " bodies in " << label << "\n";
+
+  return loop;
+}
+
 static std::string postProcessISA(const std::string &isa) {
   std::string result = isa;
 
@@ -919,12 +1298,21 @@ static std::string postProcessISA(const std::string &isa) {
       }
     }
 
+    // Pass 8: Restructure GEMM2 MFMAs from column-cycling to [4,4,4,4] grouping
+    // DISABLED: Body 1 in .LBB0_10 has SrcB register (v[142:143]) overwritten
+    // by buffer_load_dword mid-region, causing correctness failures.
+    // TODO: implement SrcB save/restore before re-enabling.
+    // loop = restructureGEMM2(std::move(loop), label);
+
     result = before + loop + after;
   }
 
   {
+    static int dumpIdx = 0;
+    std::string dumpPath =
+        "/tmp/postprocess_isa_" + std::to_string(dumpIdx++) + ".s";
     std::error_code ec;
-    llvm::raw_fd_ostream dumpFile("/tmp/postprocess_isa.s", ec);
+    llvm::raw_fd_ostream dumpFile(dumpPath, ec);
     if (!ec)
       dumpFile << result;
   }
