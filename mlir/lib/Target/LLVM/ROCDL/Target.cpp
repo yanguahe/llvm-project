@@ -3081,6 +3081,80 @@ static std::string postProcessISA(const std::string &isa) {
     }
   }
 
+  // --- Pass 15: Interleave exp2 with K reads to reduce LDS queue contention ---
+  // Finds blocks of exactly 16 consecutive v_exp_f32 followed by 8 consecutive
+  // ds_read_b128, then reorders to: 2 exp + 1 K_read repeated 8 times.
+  // This spaces consecutive ds_read_b128 by ~12 cycles instead of 4 cycles.
+  {
+    auto isExpLine = [](const std::string &line) -> bool {
+      auto trimmed = line;
+      while (!trimmed.empty() && (trimmed[0] == ' ' || trimmed[0] == '\t'))
+        trimmed.erase(0, 1);
+      return trimmed.find("v_exp_f32") == 0;
+    };
+    auto isDsReadB128Line = [](const std::string &line) -> bool {
+      auto trimmed = line;
+      while (!trimmed.empty() && (trimmed[0] == ' ' || trimmed[0] == '\t'))
+        trimmed.erase(0, 1);
+      return trimmed.find("ds_read_b128") == 0;
+    };
+
+    // Split result into lines
+    std::vector<std::string> allLines;
+    {
+      std::istringstream iss(result);
+      std::string line;
+      while (std::getline(iss, line))
+        allLines.push_back(line);
+    }
+
+    bool modified = false;
+    for (size_t i = 0; i + 23 < allLines.size(); ) {
+      // Check for 16 consecutive v_exp_f32
+      bool hasExp16 = true;
+      for (size_t e = 0; e < 16; e++) {
+        if (!isExpLine(allLines[i + e])) { hasExp16 = false; break; }
+      }
+      if (!hasExp16) { i++; continue; }
+
+      // Check for 8 consecutive ds_read_b128 right after
+      bool hasKRead8 = true;
+      for (size_t k = 0; k < 8; k++) {
+        if (!isDsReadB128Line(allLines[i + 16 + k])) { hasKRead8 = false; break; }
+      }
+      if (!hasKRead8) { i += 16; continue; }
+
+      // Extract lines
+      std::vector<std::string> expLines(allLines.begin() + i, allLines.begin() + i + 16);
+      std::vector<std::string> kLines(allLines.begin() + i + 16, allLines.begin() + i + 24);
+
+      // Build interleaved block: 2 exp + 1 K_read × 8
+      std::vector<std::string> interleaved;
+      for (int g = 0; g < 8; g++) {
+        interleaved.push_back(expLines[2 * g]);
+        interleaved.push_back(expLines[2 * g + 1]);
+        interleaved.push_back(kLines[g]);
+      }
+
+      // Replace in allLines
+      for (int j = 0; j < 24; j++)
+        allLines[i + j] = interleaved[j];
+
+      llvm::errs() << "[postProcessISA] Interleaved 16 exp2 + 8 K_reads at line "
+                    << (i + 1) << "\n";
+      modified = true;
+      i += 24;
+    }
+
+    if (modified) {
+      result.clear();
+      for (size_t j = 0; j < allLines.size(); j++) {
+        result += allLines[j];
+        if (j + 1 < allLines.size()) result += "\n";
+      }
+    }
+  }
+
   {
     static int dumpIdx = 0;
     std::string dumpPath =
