@@ -832,6 +832,68 @@ static std::string processOneLoop(std::string loop,
     }
   }
 
+  // --- Pass 6: Remove s_nop 0 between VALU instructions ---
+  // GCNHazardRecognizer inserts s_nop 0 for MFMA->VALU read-after-write
+  // hazards (11-instruction gap required). After scheduling, the gap may
+  // already be satisfied, making the s_nop redundant. We remove s_nop 0
+  // that are between two VALU (v_pk_add, v_pk_fma, v_add_f32, v_perm)
+  // instructions where neither reads an MFMA result within 11 instructions.
+  // Conservative: only remove s_nop 0 between v_pk_add_f32/v_add_f32 pairs
+  // (the softmax reduction chain) where the gap from last MFMA is large.
+  unsigned nopsRemoved = 0;
+  {
+    const std::string nop0 = "s_nop 0";
+    size_t pos = 0;
+    while (true) {
+      size_t nop = loop.find(nop0, pos);
+      if (nop == std::string::npos) break;
+      size_t nopLineStart = loop.rfind('\n', nop);
+      nopLineStart = (nopLineStart == std::string::npos) ? 0 : nopLineStart + 1;
+      size_t nopLineEnd = loop.find('\n', nop);
+      nopLineEnd = (nopLineEnd == std::string::npos) ? loop.size() : nopLineEnd + 1;
+
+      // Check line before: must be VALU (v_pk_add, v_pk_fma, v_perm, v_add_f32)
+      size_t prevLineEnd = nopLineStart;
+      if (prevLineEnd > 0) prevLineEnd--;
+      size_t prevLineStart = loop.rfind('\n', prevLineEnd);
+      prevLineStart = (prevLineStart == std::string::npos) ? 0 : prevLineStart + 1;
+      std::string prevLine = loop.substr(prevLineStart, prevLineEnd + 1 - prevLineStart);
+
+      // Check line after: must be VALU
+      std::string nextLine;
+      if (nopLineEnd < loop.size()) {
+        size_t nextEnd = loop.find('\n', nopLineEnd);
+        if (nextEnd == std::string::npos) nextEnd = loop.size();
+        nextLine = loop.substr(nopLineEnd, nextEnd - nopLineEnd);
+      }
+
+      bool prevIsValu = prevLine.find("v_pk_add_f32") != std::string::npos ||
+                        prevLine.find("v_pk_fma_f32") != std::string::npos ||
+                        prevLine.find("v_add_f32") != std::string::npos ||
+                        prevLine.find("v_perm_b32") != std::string::npos ||
+                        prevLine.find("v_mfma") != std::string::npos;
+      bool nextIsValu = nextLine.find("v_pk_add_f32") != std::string::npos ||
+                        nextLine.find("v_pk_fma_f32") != std::string::npos ||
+                        nextLine.find("v_add_f32") != std::string::npos ||
+                        nextLine.find("v_perm_b32") != std::string::npos ||
+                        nextLine.find("v_mfma") != std::string::npos;
+
+      // Check the immediately preceding non-NOP instruction is not v_mfma
+      // (MFMA→VALU hazard needs 11-instruction gap, 1 NOP is insufficient)
+      // Only skip removal if prev or next IS v_mfma (NOP between MFMA and VALU
+      // is a different hazard handled by GCNHazardRecognizer).
+      bool nearMfma = prevLine.find("v_mfma") != std::string::npos ||
+                      nextLine.find("v_mfma") != std::string::npos;
+
+      if (prevIsValu && nextIsValu && !nearMfma) {
+        loop.erase(nopLineStart, nopLineEnd - nopLineStart);
+        nopsRemoved++;
+        continue;
+      }
+      pos = nopLineEnd;
+    }
+  }
+
   llvm::errs() << "[postProcessISA] " << label << ": moved " << cmpMoved
                << " v_cmp, yield=" << yieldInserted
                << ", nopFilled=" << nopFilled
@@ -840,7 +902,8 @@ static std::string processOneLoop(std::string loop,
                << ", lgkm0Removed=" << lgkm0Removed
                << ", lgkmRelaxed=" << lgkmRelaxed
                << ", fullWaitRemoved=" << fullWaitRemoved
-               << ", setprioRemoved=" << setprioRemoved << "\n";
+               << ", setprioRemoved=" << setprioRemoved
+               << ", nopsRemoved=" << nopsRemoved << "\n";
 
   return loop;
 }
@@ -2416,16 +2479,17 @@ static std::string postProcessISA(const std::string &isa) {
     // loop = restructureGEMM2_V3(std::move(loop), label, g_maxNewVgpr);
 
     // --- Pass 10: Scalar branch to skip causal mask for non-boundary blocks ---
-    // For "Body A" style mask blocks (v_cmp + v_cndmask + v_max3 interleaved,
-    // with v_cndmask writing back to the SAME register), add a scalar branch
-    // that jumps to a fast path doing only the v_max3 rowmax when no lane
-    // needs masking (mask_delta > max_threshold for all active lanes).
+    // Generalized: matches ANY SGPR pair (not just s[0:1]), handles up to 2
+    // bodies per loop. Two sub-cases:
+    //   A) Tight v_cmp+v_cndmask block (cndCount >= 14): skip entire block
+    //   B) v_cmp-only block with scattered v_cndmask: skip v_cmp, set SGPRs
+    //      to exec so later v_cndmask passes through scores unchanged
     unsigned maskBranchesAdded = 0;
     if (loopBarriers > 2) {
       size_t mSearchPos = 0;
-      while (maskBranchesAdded < 1) {
-        // Find start of a Body-A mask block: v_cmp_lt_i32_e64 s[0:1], ...
-        size_t firstCmp = loop.find("v_cmp_lt_i32_e64 s[0:1], ", mSearchPos);
+      while (maskBranchesAdded < 2) {
+        // Find start of ANY mask block: v_cmp_lt_i32_e64 s[
+        size_t firstCmp = loop.find("v_cmp_lt_i32_e64 s[", mSearchPos);
         if (firstCmp == std::string::npos) break;
 
         size_t firstCmpLineStart = loop.rfind('\n', firstCmp);
@@ -2436,7 +2500,7 @@ static std::string postProcessISA(const std::string &isa) {
           mSearchPos = firstCmp + 1; continue;
         }
 
-        // Extract mask_delta register (last token: "v_cmp_lt_i32_e64 s[0:1], <th>, v<N>")
+        // Extract mask_delta register (last token)
         std::string cmpLine = loop.substr(firstCmp, firstCmpLineEnd - firstCmp);
         size_t lastComma = cmpLine.rfind(", ");
         if (lastComma == std::string::npos) {
@@ -2449,9 +2513,10 @@ static std::string postProcessISA(const std::string &isa) {
           mSearchPos = firstCmpLineEnd + 1; continue;
         }
 
-        // Count v_cmp_lt_i32 comparing against maskDeltaReg and find max threshold
+        // Count v_cmp_lt_i32 with maskDeltaReg, collect SGPR pairs, find max threshold
         int cmpCount = 0;
         int maxThreshold = -100;
+        std::vector<std::string> sgprPairs;
         size_t scanLim = std::min(firstCmpLineStart + 1500, loop.size());
         size_t pos = firstCmpLineStart;
         size_t lastCmpLineEnd = firstCmpLineEnd + 1;
@@ -2463,7 +2528,6 @@ static std::string postProcessISA(const std::string &isa) {
               cl.find(maskDeltaReg) != std::string::npos) {
             cmpCount++;
             lastCmpLineEnd = le + 1;
-            // Extract threshold: "v_cmp_lt_i32_e64 s[N:N+1], <th>, v<M>"
             size_t c1 = cl.find(", ");
             if (c1 != std::string::npos) {
               size_t thS = c1 + 2;
@@ -2474,19 +2538,30 @@ static std::string postProcessISA(const std::string &isa) {
                 if (th > maxThreshold) maxThreshold = th;
               }
             }
+            // Extract SGPR pair: "v_cmp_lt_i32_e64 s[N:M], ..."
+            size_t sB = cl.find("s[");
+            size_t sE = cl.find("]", sB);
+            if (sB != std::string::npos && sE != std::string::npos) {
+              std::string sp = cl.substr(sB, sE - sB + 1);
+              bool found = false;
+              for (const auto &p : sgprPairs) if (p == sp) { found = true; break; }
+              if (!found) sgprPairs.push_back(sp);
+            }
           }
           if (cl.find("v_mfma") != std::string::npos ||
               cl.find("s_barrier") != std::string::npos) break;
           pos = le + 1;
         }
 
-        if (cmpCount < 14 || maxThreshold < 20) {
+        if (cmpCount < 14 || maxThreshold < 20 || sgprPairs.empty()) {
           mSearchPos = firstCmpLineEnd + 1; continue;
         }
 
+        // Use first SGPR pair from the mask block for the check (avoids
+        // corrupting live SGPRs like s[0:1] which may hold kernel arg pointer)
+        std::string checkSgpr = sgprPairs[0];
+
         // Collect v_max3_f32 instructions in the mask+rowmax block.
-        // Body A pattern: v_max3 writes to maskDeltaReg, interleaved with v_cndmask.
-        // Stop at s_waitcnt or ds_permute (past mask section).
         std::vector<std::string> max3Lines;
         size_t lastMax3End = 0;
         pos = firstCmpLineStart;
@@ -2505,12 +2580,10 @@ static std::string postProcessISA(const std::string &isa) {
           pos = le + 1;
         }
 
-        // --- Fallback: v_max3 not interleaved with v_cndmask ---
-        // In the current ISA layout, v_max3 appears AFTER MFMAs (not in the
-        // v_cmp+v_cndmask region). We skip the v_cmp+v_cndmask block entirely.
-        // Any non-mask instructions (buffer_load, s_mov, etc.) inside the
-        // skipped region are duplicated in the fast path to maintain correctness.
         if (max3Lines.size() < 7) {
+          // No interleaved v_max3. Try two sub-cases:
+          // (A) Tight block: v_cmp + v_cndmask all together (cndCount >= 14)
+          // (B) Scattered: v_cmp block only, v_cndmask after MFMAs
           size_t lastCndEnd = 0;
           int cndCount = 0;
           std::vector<std::string> sideEffectLines;
@@ -2520,7 +2593,8 @@ static std::string postProcessISA(const std::string &isa) {
             size_t le = loop.find('\n', pos);
             if (le == std::string::npos) break;
             std::string cl = loop.substr(pos, le - pos);
-            if (cl.find("v_cndmask_b32_e64") != std::string::npos) {
+            if (cl.find("v_cndmask_b32_e64") != std::string::npos ||
+                cl.find("v_cndmask_b32_e32") != std::string::npos) {
               cndCount++;
               lastCndEnd = le + 1;
             } else if (cl.find("v_cmp_lt_i32") == std::string::npos &&
@@ -2546,77 +2620,122 @@ static std::string postProcessISA(const std::string &isa) {
             pos = le + 1;
           }
 
-          if (cndCount < 14 || lastCndEnd == 0) {
-            mSearchPos = firstCmpLineEnd + 1; continue;
-          }
-
           std::string fastLbl = ".Lfm_" + label.substr(1) + "_" +
                                 std::to_string(maskBranchesAdded);
           std::string mergeLbl = ".Lmm_" + label.substr(1) + "_" +
                                  std::to_string(maskBranchesAdded);
 
-          std::string checkCode;
-          checkCode += "\tv_cmp_ge_i32_e64 s[0:1], " +
-                       std::to_string(maxThreshold) + ", " +
-                       maskDeltaReg + "\n";
-          checkCode += "\ts_and_b64 s[0:1], s[0:1], exec\n";
-          checkCode += "\ts_cbranch_scc0 " + fastLbl + "\n";
+          if (cndCount >= 14 && lastCndEnd != 0) {
+            // Case A: tight block — skip entire v_cmp+v_cndmask region
+            std::string checkCode;
+            checkCode += "\tv_cmp_ge_i32_e64 " + checkSgpr + ", " +
+                         std::to_string(maxThreshold) + ", " +
+                         maskDeltaReg + "\n";
+            checkCode += "\ts_and_b64 " + checkSgpr + ", " + checkSgpr + ", exec\n";
+            checkCode += "\ts_cbranch_scc0 " + fastLbl + "\n";
 
-          loop.insert(firstCmpLineStart, checkCode);
-          size_t checkLen = checkCode.size();
-          lastCndEnd += checkLen;
+            loop.insert(firstCmpLineStart, checkCode);
+            size_t checkLen = checkCode.size();
+            lastCndEnd += checkLen;
 
-          std::string fastCode;
-          fastCode += "\ts_branch " + mergeLbl + "\n";
-          fastCode += fastLbl + ":\n";
-          for (const auto &sl : sideEffectLines)
-            fastCode += sl + "\n";
-          fastCode += mergeLbl + ":\n";
-          loop.insert(lastCndEnd, fastCode);
+            std::string fastCode;
+            fastCode += "\ts_branch " + mergeLbl + "\n";
+            fastCode += fastLbl + ":\n";
+            for (const auto &sl : sideEffectLines)
+              fastCode += sl + "\n";
+            fastCode += mergeLbl + ":\n";
+            loop.insert(lastCndEnd, fastCode);
 
-          llvm::errs() << "[postProcessISA] Added mask skip (fallback) in " << label
-                       << " body " << maskBranchesAdded
-                       << " (cmp=" << cmpCount
-                       << ", cnd=" << cndCount
-                       << ", sideEffects=" << sideEffectLines.size()
-                       << ", maxTh=" << maxThreshold
-                       << ", delta=" << maskDeltaReg << ")\n";
+            llvm::errs() << "[postProcessISA] Added mask skip (tight) in " << label
+                         << " body " << maskBranchesAdded
+                         << " (cmp=" << cmpCount
+                         << ", cnd=" << cndCount
+                         << ", maxTh=" << maxThreshold
+                         << ", delta=" << maskDeltaReg << ")\n";
 
-          maskBranchesAdded++;
-          mSearchPos = lastCndEnd + fastCode.size();
-          continue;
+            maskBranchesAdded++;
+            mSearchPos = lastCndEnd + fastCode.size();
+            continue;
+          }
+
+          // Case B: scattered v_cndmask — skip v_cmp block only, set SGPRs to exec
+          // The later v_cndmask in the GEMM2 region will use exec predicates
+          // and pass through scores unchanged (correct for non-boundary blocks).
+          {
+            // Collect side effects within the v_cmp block only (up to lastCmpLineEnd)
+            std::vector<std::string> cmpSideEffects;
+            pos = firstCmpLineStart;
+            while (pos < lastCmpLineEnd) {
+              size_t le = loop.find('\n', pos);
+              if (le == std::string::npos || le >= lastCmpLineEnd) break;
+              std::string cl = loop.substr(pos, le - pos);
+              if (cl.find("v_cmp_lt_i32") == std::string::npos &&
+                  cl.find("v_cmp_ge_i32") == std::string::npos &&
+                  cl.find("v_cndmask") == std::string::npos &&
+                  !cl.empty() && cl.find_first_not_of(" \t") != std::string::npos) {
+                cmpSideEffects.push_back(cl);
+              }
+              pos = le + 1;
+            }
+
+            std::string checkCode;
+            checkCode += "\tv_cmp_ge_i32_e64 " + checkSgpr + ", " +
+                         std::to_string(maxThreshold) + ", " +
+                         maskDeltaReg + "\n";
+            checkCode += "\ts_and_b64 " + checkSgpr + ", " + checkSgpr + ", exec\n";
+            checkCode += "\ts_cbranch_scc0 " + fastLbl + "\n";
+
+            loop.insert(firstCmpLineStart, checkCode);
+            size_t checkLen = checkCode.size();
+            lastCmpLineEnd += checkLen;
+
+            std::string fastCode;
+            fastCode += "\ts_branch " + mergeLbl + "\n";
+            fastCode += fastLbl + ":\n";
+            // Set all mask SGPR pairs to exec so scattered v_cndmask passes through
+            for (const auto &sp : sgprPairs)
+              fastCode += "\ts_mov_b64 " + sp + ", exec\n";
+            for (const auto &sl : cmpSideEffects)
+              fastCode += sl + "\n";
+            fastCode += mergeLbl + ":\n";
+            loop.insert(lastCmpLineEnd, fastCode);
+
+            llvm::errs() << "[postProcessISA] Added mask skip (sgpr-set) in " << label
+                         << " body " << maskBranchesAdded
+                         << " (cmp=" << cmpCount
+                         << ", sgprs=" << sgprPairs.size()
+                         << ", maxTh=" << maxThreshold
+                         << ", delta=" << maskDeltaReg << ")\n";
+
+            maskBranchesAdded++;
+            mSearchPos = lastCmpLineEnd + fastCode.size();
+            continue;
+          }
         }
 
-        // Verify this is a Body-A block: v_max3 should appear within 600 chars
-        // of the last v_cmp (Body B has MFMA between v_cmp and v_max3).
+        // Main path: v_max3 interleaved with v_cmp+v_cndmask
         size_t firstMax3Pos = loop.find("v_max3_f32", lastCmpLineEnd);
         if (firstMax3Pos == std::string::npos ||
             firstMax3Pos - lastCmpLineEnd > 600) {
           mSearchPos = firstCmpLineEnd + 1; continue;
         }
 
-        // Build unique labels
         std::string fastLbl = ".Lfm_" + label.substr(1) + "_" +
                               std::to_string(maskBranchesAdded);
         std::string mergeLbl = ".Lmm_" + label.substr(1) + "_" +
                                std::to_string(maskBranchesAdded);
 
-        // --- Insert branch check before firstCmpLineStart ---
-        // v_cmp_ge_i32_e64 s[0:1], <maxTh>, <maskDelta>  ; lanes needing mask
-        // s_and_b64 s[0:1], s[0:1], exec                  ; SCC=1 if any
-        // s_cbranch_scc0 <fastLbl>                         ; skip if none
         std::string checkCode;
-        checkCode += "\tv_cmp_ge_i32_e64 s[0:1], " +
+        checkCode += "\tv_cmp_ge_i32_e64 " + checkSgpr + ", " +
                      std::to_string(maxThreshold) + ", " +
                      maskDeltaReg + "\n";
-        checkCode += "\ts_and_b64 s[0:1], s[0:1], exec\n";
+        checkCode += "\ts_and_b64 " + checkSgpr + ", " + checkSgpr + ", exec\n";
         checkCode += "\ts_cbranch_scc0 " + fastLbl + "\n";
 
         loop.insert(firstCmpLineStart, checkCode);
         size_t checkLen = checkCode.size();
         lastMax3End += checkLen;
 
-        // --- Insert fast path after lastMax3End ---
         std::string fastCode;
         fastCode += "\ts_branch " + mergeLbl + "\n";
         fastCode += fastLbl + ":\n";
@@ -2764,6 +2883,146 @@ static std::string postProcessISA(const std::string &isa) {
     // DISABLED: Yield NOPs (s_nop 15 + s_nop 7) after s_setprio 0 caused
     // regression (111T → 109T). The 2-body loop doesn't benefit from the
     // reference ASM's yield pattern.
+
+    // --- Pass 13: Move s_setprio 1 right after "compute-start" barriers ---
+    // DISABLED: Moving s_setprio 1 earlier causes waves to compete more
+    // aggressively for shared resources, resulting in regression (112.5→111.4T).
+    // The low-priority exp2 phase allows natural wave interleaving.
+    if (false) {
+      unsigned setprioMoved = 0;
+      // Process each s_barrier in the loop
+      size_t searchPos = 0;
+      while (true) {
+        size_t bar = loop.find("s_barrier", searchPos);
+        if (bar == std::string::npos) break;
+        size_t barLineEnd = loop.find('\n', bar);
+        if (barLineEnd == std::string::npos) { searchPos = bar + 10; continue; }
+        barLineEnd++;
+
+        // Only process barriers where the first instruction starts with v_
+        // (compute-start barriers). Skip V staging barriers (ds_write),
+        // loop exit barriers (s_cbranch), and wait barriers (s_waitcnt).
+        std::string afterBar = loop.substr(barLineEnd,
+            std::min((size_t)80, loop.size() - barLineEnd));
+        // Find first non-whitespace instruction
+        size_t firstInst = afterBar.find_first_not_of(" \t\n");
+        if (firstInst == std::string::npos ||
+            afterBar.substr(firstInst, 2) != "v_") {
+          searchPos = barLineEnd;
+          continue;
+        }
+
+        // Find s_setprio 1 within the next 4000 chars
+        size_t sp1 = loop.find("s_setprio 1", barLineEnd);
+        if (sp1 == std::string::npos || sp1 - barLineEnd > 4000) {
+          searchPos = barLineEnd;
+          continue;
+        }
+
+        // Extract the s_setprio 1 block (including ASMSTART/ASMEND markers)
+        size_t sp1LineStart = loop.rfind('\n', sp1);
+        sp1LineStart = (sp1LineStart == std::string::npos) ? 0 : sp1LineStart + 1;
+        size_t sp1LineEnd = loop.find('\n', sp1);
+        sp1LineEnd = (sp1LineEnd == std::string::npos) ? loop.size() : sp1LineEnd + 1;
+
+        // Look for ASMSTART before and ASMEND after
+        size_t asmStart = sp1LineStart;
+        if (sp1LineStart > 0) {
+          std::string beforeSp1 = loop.substr(
+              (sp1LineStart > 40) ? sp1LineStart - 40 : 0,
+              (sp1LineStart > 40) ? 40 : sp1LineStart);
+          size_t asmS = beforeSp1.rfind(";;#ASMSTART");
+          if (asmS != std::string::npos) {
+            size_t asmSLineStart = beforeSp1.rfind('\n', asmS);
+            asmStart = ((sp1LineStart > 40) ? sp1LineStart - 40 : 0) +
+                       ((asmSLineStart == std::string::npos) ? 0 : asmSLineStart + 1);
+          }
+        }
+        size_t asmEnd = sp1LineEnd;
+        if (sp1LineEnd < loop.size()) {
+          std::string afterSp1 = loop.substr(sp1LineEnd,
+              std::min((size_t)40, loop.size() - sp1LineEnd));
+          size_t asmE = afterSp1.find(";;#ASMEND");
+          if (asmE != std::string::npos) {
+            size_t asmEEnd = afterSp1.find('\n', asmE);
+            asmEnd = sp1LineEnd + ((asmEEnd == std::string::npos) ? afterSp1.size() : asmEEnd + 1);
+          }
+        }
+
+        std::string sp1Block = loop.substr(asmStart, asmEnd - asmStart);
+
+        // Only move if s_setprio 1 is actually AFTER the barrier (not already adjacent)
+        if (asmStart <= barLineEnd + 5) {
+          searchPos = asmEnd;
+          continue;
+        }
+
+        // Remove from current position and insert right after barrier
+        loop.erase(asmStart, asmEnd - asmStart);
+        // Recalculate barLineEnd (it hasn't changed since erasure is after it)
+        loop.insert(barLineEnd, sp1Block);
+        setprioMoved++;
+        llvm::errs() << "[postProcessISA] Moved s_setprio 1 to after barrier in "
+                     << label << "\n";
+        searchPos = barLineEnd + sp1Block.size();
+      }
+    }
+
+    // --- Pass 14: Remove redundant pre-barrier lgkmcnt(0) ---
+    // DISABLED: The lgkmcnt(0) before barriers serves as a useful scheduling
+    // fence even when technically redundant. Removing it can regress.
+    if (false) {
+      unsigned redundantLgkm = 0;
+      const std::string lgk0 = "s_waitcnt lgkmcnt(0)";
+      size_t pos = 0;
+      while (true) {
+        size_t wc = loop.find(lgk0, pos);
+        if (wc == std::string::npos) break;
+        size_t wcLineEnd = loop.find('\n', wc);
+        wcLineEnd = (wcLineEnd == std::string::npos) ? loop.size() : wcLineEnd + 1;
+
+        // Check if followed by s_barrier within 5 lines
+        std::string afterWc = loop.substr(wcLineEnd,
+            std::min((size_t)60, loop.size() - wcLineEnd));
+        if (afterWc.find("s_barrier") == std::string::npos) {
+          pos = wcLineEnd;
+          continue;
+        }
+
+        // Check if this lgkmcnt(0) is part of a FULL wait
+        size_t wcLineStart = loop.rfind('\n', wc);
+        wcLineStart = (wcLineStart == std::string::npos) ? 0 : wcLineStart + 1;
+        std::string wcLine = loop.substr(wcLineStart, wcLineEnd - wcLineStart);
+        if (wcLine.find("vmcnt") != std::string::npos ||
+            wcLine.find("expcnt") != std::string::npos) {
+          pos = wcLineEnd;
+          continue;
+        }
+
+        // Look back for the previous lgkmcnt(0)
+        size_t lookStart = (wcLineStart > 5000) ? wcLineStart - 5000 : 0;
+        std::string before = loop.substr(lookStart, wcLineStart - lookStart);
+        size_t prevLgkm = before.rfind("lgkmcnt(0)");
+        if (prevLgkm == std::string::npos) {
+          pos = wcLineEnd;
+          continue;
+        }
+
+        // Check no ds_ operations between previous lgkmcnt(0) and this one
+        std::string gap = before.substr(prevLgkm);
+        bool hasDS = gap.find("ds_read") != std::string::npos ||
+                     gap.find("ds_write") != std::string::npos ||
+                     gap.find("ds_permute") != std::string::npos;
+        if (!hasDS) {
+          loop.erase(wcLineStart, wcLineEnd - wcLineStart);
+          redundantLgkm++;
+          llvm::errs() << "[postProcessISA] Removed redundant pre-barrier lgkmcnt(0) in "
+                       << label << "\n";
+          continue;
+        }
+        pos = wcLineEnd;
+      }
+    }
 
     result = before + loop + after;
   }
