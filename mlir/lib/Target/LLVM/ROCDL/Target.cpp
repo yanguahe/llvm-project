@@ -688,52 +688,65 @@ static std::string processOneLoop(std::string loop,
     }
   }
 
-  // --- Pass 4d: Remove redundant consecutive lgkmcnt(0) ---
-  // Only remove if the second lgkmcnt(0) is within 200 chars of the first
-  // (i.e., truly consecutive with only a few VALU ops between).
-  // Also reject if the second lgkmcnt(0) is immediately before s_barrier
-  // (pre-barrier waits must be kept even if technically redundant).
+  // --- Pass 4d: Remove redundant lgkmcnt(0) using lgkm counter tracking ---
+  // Tracks outstanding lgkm operations through the loop body. If a lgkmcnt(0)
+  // is encountered when the counter is already 0, it's redundant and removed.
+  // This handles the case where lgkmcnt(0) before s_barrier has no outstanding
+  // lgkm ops (e.g., after O rescale with no ds/lds ops).
   unsigned lgkm0Removed = 0;
   {
-    const std::string lk0 = "lgkmcnt(0)";
+    int lgkmOutstanding = 0;
     size_t pos = 0;
-    while (true) {
-      size_t first = loop.find(lk0, pos);
-      if (first == std::string::npos) break;
-      size_t firstEnd = loop.find('\n', first);
-      if (firstEnd == std::string::npos) break;
-      firstEnd++;
-      size_t second = loop.find(lk0, firstEnd);
-      if (second == std::string::npos) break;
-      size_t gap = second - firstEnd;
-      std::string between = loop.substr(firstEnd, gap);
-      if (gap < 200 &&
-          between.find("ds_read") == std::string::npos &&
-          between.find("ds_write") == std::string::npos &&
-          between.find("ds_permute") == std::string::npos &&
-          between.find("buffer_load") == std::string::npos &&
-          between.find("s_barrier") == std::string::npos) {
-        // Don't remove if second lgkmcnt(0) is right before s_barrier
-        size_t secLineEnd = loop.find('\n', second);
-        secLineEnd = (secLineEnd == std::string::npos) ? loop.size() : secLineEnd + 1;
-        std::string afterSec = loop.substr(secLineEnd,
-            std::min((size_t)40, loop.size() - secLineEnd));
-        if (afterSec.find("s_barrier") != std::string::npos) {
-          pos = firstEnd;
-          continue;
-        }
-        size_t secLineStart = loop.rfind('\n', second);
-        secLineStart = (secLineStart == std::string::npos) ? 0 : secLineStart + 1;
-        std::string secLine = loop.substr(secLineStart, second + 15 - secLineStart);
-        if (secLine.find("expcnt") == std::string::npos) {
-          loop.erase(secLineStart, secLineEnd - secLineStart);
-          lgkm0Removed++;
-          llvm::errs() << "[postProcessISA] Removed redundant lgkmcnt(0) in "
-                       << label << "\n";
-          continue;
+    while (pos < loop.size()) {
+      size_t le = loop.find('\n', pos);
+      if (le == std::string::npos) break;
+      std::string cl = loop.substr(pos, le - pos);
+      std::string clt = cl;
+      size_t fns = clt.find_first_not_of(" \t");
+      if (fns != std::string::npos) clt = clt.substr(fns);
+
+      // Count lgkm-generating instructions
+      if (clt.find("ds_read") == 0 || clt.find("ds_write") == 0 ||
+          clt.find("ds_permute") == 0 || clt.find("s_load") == 0) {
+        lgkmOutstanding++;
+      } else if (clt.find("buffer_load") == 0 &&
+                 cl.find(" lds") != std::string::npos) {
+        lgkmOutstanding++;
+      }
+
+      // Check for lgkmcnt
+      size_t lgkPos = cl.find("lgkmcnt(");
+      if (lgkPos != std::string::npos) {
+        size_t numStart = lgkPos + 8;
+        size_t numEnd = cl.find(')', numStart);
+        if (numEnd != std::string::npos) {
+          int cnt = atoi(cl.substr(numStart, numEnd - numStart).c_str());
+          if (cnt == 0 && lgkmOutstanding == 0) {
+            // This lgkmcnt(0) is redundant — no outstanding lgkm ops
+            // Check it's a standalone s_waitcnt lgkmcnt(0) (not a FULL wait)
+            if (cl.find("expcnt") == std::string::npos &&
+                cl.find("vmcnt") == std::string::npos) {
+              loop.erase(pos, le + 1 - pos);
+              lgkm0Removed++;
+              llvm::errs() << "[postProcessISA] Removed redundant lgkmcnt(0) in "
+                           << label << "\n";
+              continue; // don't advance pos — content shifted
+            }
+          }
+          if (cnt == 0) {
+            lgkmOutstanding = 0;
+          } else {
+            lgkmOutstanding = std::min(lgkmOutstanding, cnt);
+          }
         }
       }
-      pos = firstEnd;
+
+      // s_barrier resets lgkm (all waves synchronized)
+      if (clt.find("s_barrier") == 0) {
+        lgkmOutstanding = 0;
+      }
+
+      pos = le + 1;
     }
   }
 
