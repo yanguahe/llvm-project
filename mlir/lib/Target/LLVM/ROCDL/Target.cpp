@@ -505,25 +505,8 @@ static std::string processOneLoop(std::string loop,
     loop.insert(insertPoint, insertBlock);
   }
 
-  // --- Pass 2: Insert yield NOPs after the LAST s_setprio 0 (before barrier) ---
+  // --- Pass 2: Reserved for future scheduling optimizations ---
   unsigned yieldInserted = 0;
-  size_t setprio0 = insertYield ? loop.rfind("s_setprio 0") : std::string::npos;
-  if (setprio0 != std::string::npos) {
-    size_t asmEnd = loop.find(";;#ASMEND", setprio0);
-    if (asmEnd != std::string::npos) {
-      size_t asmEndLine = loop.find('\n', asmEnd);
-      if (asmEndLine != std::string::npos) {
-        asmEndLine++;
-        std::string nextChunk = loop.substr(asmEndLine,
-            std::min((size_t)40, loop.size() - asmEndLine));
-        if (nextChunk.find("s_nop 15") == std::string::npos &&
-            nextChunk.find("s_nop 7") == std::string::npos) {
-          loop.insert(asmEndLine, "\ts_nop 15\n\ts_nop 7\n");
-          yieldInserted = 1;
-        }
-      }
-    }
-  }
 
   // Detect 2x unrolled loops by counting barriers (>2 means multi-body).
   // Skip aggressive waitcnt optimizations for multi-body loops to avoid
@@ -611,7 +594,7 @@ static std::string processOneLoop(std::string loop,
   }
 
   // --- Pass 4b: Replace pre-GEMM1 FULL wait with lgkmcnt(0) ---
-  if (!isMultiBody) {
+  {
     const std::string fullWait = "s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)";
     size_t pos = 0;
     while (true) {
@@ -658,7 +641,6 @@ static std::string processOneLoop(std::string loop,
     while (true) {
       size_t first = loop.find(vm0, pos);
       if (first == std::string::npos) break;
-      // Skip if it's part of a FULL wait
       std::string restFirst = loop.substr(first, 60);
       if (restFirst.find("expcnt") != std::string::npos) {
         pos = first + 20;
@@ -667,7 +649,6 @@ static std::string processOneLoop(std::string loop,
       size_t firstEnd = loop.find('\n', first);
       if (firstEnd == std::string::npos) break;
       firstEnd++;
-      // Find next vmcnt(0) (standalone or FULL)
       size_t second = loop.find(vm0, firstEnd);
       if (second == std::string::npos) break;
       std::string between = loop.substr(firstEnd, second - firstEnd);
@@ -675,7 +656,6 @@ static std::string processOneLoop(std::string loop,
           between.find("global_load") == std::string::npos) {
         std::string restSecond = loop.substr(second, 60);
         if (restSecond.find("expcnt") == std::string::npos) {
-          // Standalone vmcnt(0) — remove it
           size_t secLineStart = loop.rfind('\n', second);
           secLineStart = (secLineStart == std::string::npos) ? 0 : secLineStart + 1;
           size_t secLineEnd = loop.find('\n', second);
@@ -692,8 +672,12 @@ static std::string processOneLoop(std::string loop,
   }
 
   // --- Pass 4d: Remove redundant consecutive lgkmcnt(0) ---
+  // Only remove if the second lgkmcnt(0) is within 200 chars of the first
+  // (i.e., truly consecutive with only a few VALU ops between).
+  // Also reject if the second lgkmcnt(0) is immediately before s_barrier
+  // (pre-barrier waits must be kept even if technically redundant).
   unsigned lgkm0Removed = 0;
-  if (!isMultiBody) {
+  {
     const std::string lk0 = "lgkmcnt(0)";
     size_t pos = 0;
     while (true) {
@@ -704,18 +688,27 @@ static std::string processOneLoop(std::string loop,
       firstEnd++;
       size_t second = loop.find(lk0, firstEnd);
       if (second == std::string::npos) break;
-      std::string between = loop.substr(firstEnd, second - firstEnd);
-      if (between.find("ds_read") == std::string::npos &&
+      size_t gap = second - firstEnd;
+      std::string between = loop.substr(firstEnd, gap);
+      if (gap < 200 &&
+          between.find("ds_read") == std::string::npos &&
           between.find("ds_write") == std::string::npos &&
           between.find("ds_permute") == std::string::npos &&
-          between.find("buffer_load") == std::string::npos) {
-        // Check the second lgkmcnt(0) is standalone (not part of FULL wait)
+          between.find("buffer_load") == std::string::npos &&
+          between.find("s_barrier") == std::string::npos) {
+        // Don't remove if second lgkmcnt(0) is right before s_barrier
+        size_t secLineEnd = loop.find('\n', second);
+        secLineEnd = (secLineEnd == std::string::npos) ? loop.size() : secLineEnd + 1;
+        std::string afterSec = loop.substr(secLineEnd,
+            std::min((size_t)40, loop.size() - secLineEnd));
+        if (afterSec.find("s_barrier") != std::string::npos) {
+          pos = firstEnd;
+          continue;
+        }
         size_t secLineStart = loop.rfind('\n', second);
         secLineStart = (secLineStart == std::string::npos) ? 0 : secLineStart + 1;
         std::string secLine = loop.substr(secLineStart, second + 15 - secLineStart);
         if (secLine.find("expcnt") == std::string::npos) {
-          size_t secLineEnd = loop.find('\n', second);
-          secLineEnd = (secLineEnd == std::string::npos) ? loop.size() : secLineEnd + 1;
           loop.erase(secLineStart, secLineEnd - secLineStart);
           lgkm0Removed++;
           llvm::errs() << "[postProcessISA] Removed redundant lgkmcnt(0) in "
@@ -726,6 +719,50 @@ static std::string processOneLoop(std::string loop,
       pos = firstEnd;
     }
   }
+
+  // --- Pass 4e: Remove FULL wait redundant with preceding lgkmcnt(0)+vmcnt(0) ---
+  // Pattern: lgkmcnt(0)...vmcnt(0)...FULL_WAIT with no LDS/VMEM between lgkmcnt(0) and FULL.
+  // Also handles: lgkmcnt(0)...FULL_WAIT with no LDS/VMEM between (vmcnt already 0).
+  unsigned fullWaitRemoved = 0;
+  {
+    const std::string fullWait = "s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)";
+    size_t pos = 0;
+    while (true) {
+      size_t fw = loop.find(fullWait, pos);
+      if (fw == std::string::npos) break;
+      size_t fwLineStart = loop.rfind('\n', fw);
+      fwLineStart = (fwLineStart == std::string::npos) ? 0 : fwLineStart + 1;
+      size_t fwLineEnd = loop.find('\n', fw);
+      fwLineEnd = (fwLineEnd == std::string::npos) ? loop.size() : fwLineEnd + 1;
+
+      // Look back up to 600 chars for a preceding lgkmcnt(0)
+      size_t lookStart = (fwLineStart > 600) ? fwLineStart - 600 : 0;
+      std::string before = loop.substr(lookStart, fwLineStart - lookStart);
+      size_t lgkm0 = before.rfind("lgkmcnt(0)");
+      if (lgkm0 != std::string::npos) {
+        std::string gap = before.substr(lgkm0);
+        bool hasLDS = gap.find("ds_read") != std::string::npos ||
+                      gap.find("ds_write") != std::string::npos ||
+                      gap.find("ds_permute") != std::string::npos;
+        bool hasVMEM = gap.find("buffer_load") != std::string::npos ||
+                       gap.find("global_load") != std::string::npos;
+        if (!hasLDS && !hasVMEM) {
+          loop.erase(fwLineStart, fwLineEnd - fwLineStart);
+          fullWaitRemoved++;
+          llvm::errs() << "[postProcessISA] Removed redundant FULL wait in "
+                       << label << "\n";
+          continue;
+        }
+      }
+      pos = fw + 1;
+    }
+  }
+
+  // --- Pass 9: Relax pre-GEMM1 lgkmcnt(0) to lgkmcnt(1) ---
+  // DISABLED: ds_permute result (v73) is consumed immediately after the wait
+  // (v_add_f32 v64, v72, v73), not later during GEMM1. Relaxing to lgkmcnt(1)
+  // would read v73 before the permute completes → garbage results.
+  unsigned lgkmRelaxed = 0;
 
   // --- Pass 5: Remove useless s_setprio 1 immediately followed by s_setprio 0 ---
   // Currently disabled: removing the pair causes slight regression.
@@ -784,6 +821,8 @@ static std::string processOneLoop(std::string loop,
                << ", vmcntRelaxed=" << vmcntRelaxed
                << ", vmcnt0Removed=" << vmcnt0Removed
                << ", lgkm0Removed=" << lgkm0Removed
+               << ", lgkmRelaxed=" << lgkmRelaxed
+               << ", fullWaitRemoved=" << fullWaitRemoved
                << ", setprioRemoved=" << setprioRemoved << "\n";
 
   return loop;
@@ -1216,7 +1255,7 @@ static std::string postProcessISA(const std::string &isa) {
         bpos = b + 10;
       }
     }
-    bool doYield = false;
+    bool doYield = (loopBarriers > 2);
     bool fillGap = false;
     bool hoistVcmp = (loopBarriers <= 2);
     loop = processOneLoop(std::move(loop), label, doYield, fillGap, hoistVcmp);
@@ -1256,7 +1295,7 @@ static std::string postProcessISA(const std::string &isa) {
           }
         }
 
-        if (pkMulCount >= 999) {
+        if (false && pkMulCount >= 999) {
           // Look for s_setprio 1 / s_setprio 0 pair after the block
           std::string afterBlock = loop.substr(lastPkMulLineEnd,
               std::min((size_t)300, loop.size() - lastPkMulLineEnd));
@@ -1303,6 +1342,262 @@ static std::string postProcessISA(const std::string &isa) {
     // by buffer_load_dword mid-region, causing correctness failures.
     // TODO: implement SrcB save/restore before re-enabling.
     // loop = restructureGEMM2(std::move(loop), label);
+
+    // --- Pass 10: Scalar branch to skip causal mask for non-boundary blocks ---
+    // For "Body A" style mask blocks (v_cmp + v_cndmask + v_max3 interleaved,
+    // with v_cndmask writing back to the SAME register), add a scalar branch
+    // that jumps to a fast path doing only the v_max3 rowmax when no lane
+    // needs masking (mask_delta > max_threshold for all active lanes).
+    unsigned maskBranchesAdded = 0;
+    if (loopBarriers > 2) {
+      size_t mSearchPos = 0;
+      while (true) {
+        // Find start of a Body-A mask block: v_cmp_lt_i32_e64 s[0:1], ...
+        size_t firstCmp = loop.find("v_cmp_lt_i32_e64 s[0:1], ", mSearchPos);
+        if (firstCmp == std::string::npos) break;
+
+        size_t firstCmpLineStart = loop.rfind('\n', firstCmp);
+        firstCmpLineStart = (firstCmpLineStart == std::string::npos)
+                                ? 0 : firstCmpLineStart + 1;
+        size_t firstCmpLineEnd = loop.find('\n', firstCmp);
+        if (firstCmpLineEnd == std::string::npos) {
+          mSearchPos = firstCmp + 1; continue;
+        }
+
+        // Extract mask_delta register (last token: "v_cmp_lt_i32_e64 s[0:1], <th>, v<N>")
+        std::string cmpLine = loop.substr(firstCmp, firstCmpLineEnd - firstCmp);
+        size_t lastComma = cmpLine.rfind(", ");
+        if (lastComma == std::string::npos) {
+          mSearchPos = firstCmpLineEnd + 1; continue;
+        }
+        std::string maskDeltaReg = cmpLine.substr(lastComma + 2);
+        while (!maskDeltaReg.empty() && isspace(maskDeltaReg.back()))
+          maskDeltaReg.pop_back();
+        if (maskDeltaReg.empty() || maskDeltaReg[0] != 'v') {
+          mSearchPos = firstCmpLineEnd + 1; continue;
+        }
+
+        // Count v_cmp_lt_i32 comparing against maskDeltaReg and find max threshold
+        int cmpCount = 0;
+        int maxThreshold = -100;
+        size_t scanLim = std::min(firstCmpLineStart + 1500, loop.size());
+        size_t pos = firstCmpLineStart;
+        size_t lastCmpLineEnd = firstCmpLineEnd + 1;
+        while (pos < scanLim) {
+          size_t le = loop.find('\n', pos);
+          if (le == std::string::npos) break;
+          std::string cl = loop.substr(pos, le - pos);
+          if (cl.find("v_cmp_lt_i32") != std::string::npos &&
+              cl.find(maskDeltaReg) != std::string::npos) {
+            cmpCount++;
+            lastCmpLineEnd = le + 1;
+            // Extract threshold: "v_cmp_lt_i32_e64 s[N:N+1], <th>, v<M>"
+            size_t c1 = cl.find(", ");
+            if (c1 != std::string::npos) {
+              size_t thS = c1 + 2;
+              size_t thE = cl.find(",", thS);
+              if (thE != std::string::npos) {
+                std::string thStr = cl.substr(thS, thE - thS);
+                int th = atoi(thStr.c_str());
+                if (th > maxThreshold) maxThreshold = th;
+              }
+            }
+          }
+          if (cl.find("v_mfma") != std::string::npos ||
+              cl.find("s_barrier") != std::string::npos) break;
+          pos = le + 1;
+        }
+
+        if (cmpCount < 14 || maxThreshold < 20) {
+          mSearchPos = firstCmpLineEnd + 1; continue;
+        }
+
+        // Collect v_max3_f32 instructions in the mask+rowmax block.
+        // Body A pattern: v_max3 writes to maskDeltaReg, interleaved with v_cndmask.
+        // Stop at s_waitcnt or ds_permute (past mask section).
+        std::vector<std::string> max3Lines;
+        size_t lastMax3End = 0;
+        pos = firstCmpLineStart;
+        scanLim = std::min(firstCmpLineStart + 2500, loop.size());
+        while (pos < scanLim) {
+          size_t le = loop.find('\n', pos);
+          if (le == std::string::npos) break;
+          std::string cl = loop.substr(pos, le - pos);
+          if (cl.find("v_max3_f32") != std::string::npos &&
+              cl.find(maskDeltaReg) != std::string::npos) {
+            max3Lines.push_back(cl);
+            lastMax3End = le + 1;
+          }
+          if (cl.find("s_waitcnt") != std::string::npos ||
+              cl.find("ds_permute") != std::string::npos) break;
+          pos = le + 1;
+        }
+
+        if (max3Lines.size() < 7 || lastMax3End == 0) {
+          mSearchPos = firstCmpLineEnd + 1; continue;
+        }
+
+        // Verify this is a Body-A block: v_max3 should appear within 600 chars
+        // of the last v_cmp (Body B has MFMA between v_cmp and v_max3).
+        size_t firstMax3Pos = loop.find("v_max3_f32", lastCmpLineEnd);
+        if (firstMax3Pos == std::string::npos ||
+            firstMax3Pos - lastCmpLineEnd > 600) {
+          mSearchPos = firstCmpLineEnd + 1; continue;
+        }
+
+        // Build unique labels
+        std::string fastLbl = ".Lfm_" + label.substr(1) + "_" +
+                              std::to_string(maskBranchesAdded);
+        std::string mergeLbl = ".Lmm_" + label.substr(1) + "_" +
+                               std::to_string(maskBranchesAdded);
+
+        // --- Insert branch check before firstCmpLineStart ---
+        // v_cmp_ge_i32_e64 s[0:1], <maxTh>, <maskDelta>  ; lanes needing mask
+        // s_and_b64 s[0:1], s[0:1], exec                  ; SCC=1 if any
+        // s_cbranch_scc0 <fastLbl>                         ; skip if none
+        std::string checkCode;
+        checkCode += "\tv_cmp_ge_i32_e64 s[0:1], " +
+                     std::to_string(maxThreshold) + ", " +
+                     maskDeltaReg + "\n";
+        checkCode += "\ts_and_b64 s[0:1], s[0:1], exec\n";
+        checkCode += "\ts_cbranch_scc0 " + fastLbl + "\n";
+
+        loop.insert(firstCmpLineStart, checkCode);
+        size_t checkLen = checkCode.size();
+        lastMax3End += checkLen;
+
+        // --- Insert fast path after lastMax3End ---
+        std::string fastCode;
+        fastCode += "\ts_branch " + mergeLbl + "\n";
+        fastCode += fastLbl + ":\n";
+        for (const auto &ml : max3Lines)
+          fastCode += ml + "\n";
+        fastCode += mergeLbl + ":\n";
+
+        loop.insert(lastMax3End, fastCode);
+
+        llvm::errs() << "[postProcessISA] Added mask skip branch in " << label
+                     << " body " << maskBranchesAdded
+                     << " (cmp=" << cmpCount
+                     << ", maxTh=" << maxThreshold
+                     << ", max3=" << max3Lines.size()
+                     << ", delta=" << maskDeltaReg << ")\n";
+
+        maskBranchesAdded++;
+        mSearchPos = lastMax3End + fastCode.size();
+      }
+
+      // --- Pass 10b: Body B mask skip (v_cmp block only, set SGPRs to exec) ---
+      // Body B's v_cmp starts with v_cmp_lt_i32_e32 vcc, and is contiguous,
+      // but v_cndmask is interleaved with MFMA. We skip just the v_cmp block
+      // and set all predicate SGPRs to exec so v_cndmask becomes a no-op.
+      mSearchPos = 0;
+      while (true) {
+        std::string bodyBMarker = "v_cmp_lt_i32_e32 vcc, ";
+        size_t vcmpPos = loop.find(bodyBMarker, mSearchPos);
+        if (vcmpPos == std::string::npos) break;
+
+        size_t vcmpLineStart = loop.rfind('\n', vcmpPos);
+        vcmpLineStart = (vcmpLineStart == std::string::npos)
+                            ? 0 : vcmpLineStart + 1;
+        size_t vcmpLineEnd = loop.find('\n', vcmpPos);
+        if (vcmpLineEnd == std::string::npos) {
+          mSearchPos = vcmpPos + 1; continue;
+        }
+
+        // Extract mask_delta register
+        std::string bLine = loop.substr(vcmpPos, vcmpLineEnd - vcmpPos);
+        size_t bLastComma = bLine.rfind(", ");
+        if (bLastComma == std::string::npos) {
+          mSearchPos = vcmpLineEnd + 1; continue;
+        }
+        std::string bMaskReg = bLine.substr(bLastComma + 2);
+        while (!bMaskReg.empty() && isspace(bMaskReg.back()))
+          bMaskReg.pop_back();
+        if (bMaskReg.empty() || bMaskReg[0] != 'v') {
+          mSearchPos = vcmpLineEnd + 1; continue;
+        }
+
+        // Count v_cmp_lt_i32 in this contiguous block
+        int bCmpCount = 0;
+        size_t bLastCmpEnd = vcmpLineEnd + 1;
+        std::vector<std::string> sgprPairs; // SGPR pairs used (e.g., "s[0:1]")
+        bool usesVcc = false;
+        size_t bScanLim = std::min(vcmpLineStart + 1200, loop.size());
+        size_t bPos = vcmpLineStart;
+        while (bPos < bScanLim) {
+          size_t ble = loop.find('\n', bPos);
+          if (ble == std::string::npos) break;
+          std::string bcl = loop.substr(bPos, ble - bPos);
+          if (bcl.find("v_cmp_lt_i32") != std::string::npos &&
+              bcl.find(bMaskReg) != std::string::npos) {
+            bCmpCount++;
+            bLastCmpEnd = ble + 1;
+            if (bcl.find("vcc") != std::string::npos)
+              usesVcc = true;
+            // Extract SGPR pair: s[N:N+1]
+            size_t sPos = bcl.find("s[");
+            if (sPos != std::string::npos) {
+              size_t sEnd = bcl.find(']', sPos);
+              if (sEnd != std::string::npos) {
+                std::string sp = bcl.substr(sPos, sEnd - sPos + 1);
+                bool found = false;
+                for (const auto &existing : sgprPairs)
+                  if (existing == sp) { found = true; break; }
+                if (!found) sgprPairs.push_back(sp);
+              }
+            }
+          } else if (bCmpCount > 0) {
+            break; // Past the contiguous v_cmp block
+          }
+          bPos = ble + 1;
+        }
+
+        if (bCmpCount < 14) {
+          mSearchPos = vcmpLineEnd + 1; continue;
+        }
+
+        std::string bFastLbl = ".Lfm_" + label.substr(1) + "_" +
+                               std::to_string(maskBranchesAdded);
+        std::string bMergeLbl = ".Lmm_" + label.substr(1) + "_" +
+                                std::to_string(maskBranchesAdded);
+
+        // Insert check before the v_cmp block
+        std::string bCheck;
+        bCheck += "\tv_cmp_ge_i32_e64 s[0:1], 26, " + bMaskReg + "\n";
+        bCheck += "\ts_and_b64 s[0:1], s[0:1], exec\n";
+        bCheck += "\ts_cbranch_scc0 " + bFastLbl + "\n";
+        loop.insert(vcmpLineStart, bCheck);
+        bLastCmpEnd += bCheck.size();
+
+        // Insert fast path (set all preds to exec) + s_branch after v_cmp block
+        std::string bFast;
+        bFast += "\ts_branch " + bMergeLbl + "\n";
+        bFast += bFastLbl + ":\n";
+        if (usesVcc)
+          bFast += "\ts_mov_b64 vcc, exec\n";
+        for (const auto &sp : sgprPairs)
+          bFast += "\ts_mov_b64 " + sp + ", exec\n";
+        bFast += bMergeLbl + ":\n";
+        loop.insert(bLastCmpEnd, bFast);
+
+        llvm::errs() << "[postProcessISA] Added mask skip (Body B) in " << label
+                     << " body " << maskBranchesAdded
+                     << " (cmp=" << bCmpCount
+                     << ", sgprPairs=" << sgprPairs.size()
+                     << ", vcc=" << usesVcc
+                     << ", delta=" << bMaskReg << ")\n";
+
+        maskBranchesAdded++;
+        mSearchPos = bLastCmpEnd + bFast.size();
+      }
+    }
+
+    // --- Pass 11: Relocate s_setprio around O rescale + add yield NOPs ---
+    // DISABLED: Relocating s_setprio from GEMM1 boundary (compiler-chosen)
+    // to O rescale boundary (reference ASM pattern) caused regression
+    // (111T → 110.4T without yield, 107.7T with yield). The 2-body loop
+    // structure has different timing than the reference's 5-body loop.
 
     result = before + loop + after;
   }
@@ -1390,6 +1685,15 @@ std::optional<SmallVector<char, 0>> SerializeGPUModuleBase::moduleToObjectImpl(
 
   // Post-process ISA: insert yield nops after s_setprio 0 in inner loops.
   *serializedISA = postProcessISA(*serializedISA);
+
+  // Debug: dump modified ISA to temp file
+  {
+    static int dumpIdx = 0;
+    std::string path = "/tmp/postprocess_isa_" + std::to_string(dumpIdx++) + ".s";
+    std::error_code ec;
+    llvm::raw_fd_ostream os(path, ec);
+    if (!ec) os << *serializedISA;
+  }
 
 #define DEBUG_TYPE "serialize-to-isa"
   LLVM_DEBUG({
