@@ -338,12 +338,29 @@ SerializeGPUModuleBase::assembleIsa(StringRef isa) {
   }
 
   parser->setTargetParser(*tap);
-  parser->Run(false);
+  bool parseError = parser->Run(false);
+  if (parseError)
+    llvm::errs() << "[assembleIsa] MC parser reported errors! result size="
+                 << result.size() << "\n";
+  else
+    llvm::errs() << "[assembleIsa] OK, result size=" << result.size() << "\n";
   return std::move(result);
 }
 
 std::optional<SmallVector<char, 0>>
 SerializeGPUModuleBase::compileToBinary(const std::string &serializedISA) {
+  // Debug: dump ISA text entering the assembler
+  {
+    static int cbtDumpIdx = 0;
+    std::string path =
+        "/tmp/compile_to_binary_" + std::to_string(cbtDumpIdx++) + ".s";
+    std::error_code ec;
+    llvm::raw_fd_ostream os(path, ec);
+    if (!ec)
+      os << serializedISA;
+    llvm::errs() << "[compileToBinary] dumped " << serializedISA.size()
+                 << " bytes to " << path << "\n";
+  }
   // Assemble the ISA.
   std::optional<SmallVector<char, 0>> isaBinary = assembleIsa(serializedISA);
 
@@ -931,7 +948,7 @@ static std::string restructureGEMM2(std::string loop,
         d.dest = extractVGPRRange(stripped, 0);
         size_t offPos = stripped.find("offset:");
         d.offset = (offPos != std::string::npos)
-                       ? std::stoi(stripped.substr(offPos + 7))
+                       ? atoi(stripped.substr(offPos + 7).c_str())
                        : -1;
         dsReads.push_back(d);
       }
@@ -1131,6 +1148,110 @@ static std::string restructureGEMM2(std::string loop,
       continue;
     }
 
+    // Check for SrcB register overwrites between first and last MFMA.
+    // Only writes BETWEEN MFMAs matter; writes after the last MFMA are safe.
+    std::set<int> srcBVGPRs;
+    for (auto &s : srcBRegs) {
+      size_t lb = s.find('[');
+      size_t colon = s.find(':');
+      size_t rb = s.find(']');
+      if (lb != std::string::npos && colon != std::string::npos &&
+          rb != std::string::npos) {
+        int lo = atoi(s.substr(lb + 1, colon - lb - 1).c_str());
+        int hi = atoi(s.substr(colon + 1, rb - colon - 1).c_str());
+        for (int r = lo; r <= hi; r++)
+          srcBVGPRs.insert(r);
+      }
+    }
+
+    std::set<int> trackedLines;
+    for (auto &m : mfmas)
+      trackedLines.insert(m.lineIdx);
+    for (int d = 0; d < 16; d++)
+      trackedLines.insert(dsReads[d].lineIdx);
+
+    int lastMfmaLine = mfmas.back().lineIdx;
+
+    auto checkVGPRConflict = [&](const std::string &stripped, int lineIdx) {
+      // Try v[X:Y] range first
+      std::string dest = extractVGPRRange(stripped, 0);
+      if (!dest.empty()) {
+        size_t lb = dest.find('[');
+        size_t colon = dest.find(':');
+        size_t rb = dest.find(']');
+        if (lb != std::string::npos && colon != std::string::npos &&
+            rb != std::string::npos) {
+          int lo = atoi(dest.substr(lb + 1, colon - lb - 1).c_str());
+          int hi = atoi(dest.substr(colon + 1, rb - colon - 1).c_str());
+          for (int r = lo; r <= hi; r++) {
+            if (srcBVGPRs.count(r)) {
+              llvm::errs() << "  SrcB CONFLICT: v" << r
+                           << " at line " << lineIdx << ": " << stripped << "\n";
+              return true;
+            }
+          }
+        }
+        return false;
+      }
+      // Try single vN
+      size_t vpos = stripped.find(" v");
+      if (vpos != std::string::npos) {
+        vpos++;
+        size_t numStart = vpos + 1;
+        size_t numEnd = numStart;
+        while (numEnd < stripped.size() && isdigit(stripped[numEnd]))
+          numEnd++;
+        if (numEnd > numStart) {
+          int vgpr = atoi(stripped.substr(numStart, numEnd - numStart).c_str());
+          if (srcBVGPRs.count(vgpr)) {
+            llvm::errs() << "  SrcB CONFLICT: v" << vgpr
+                         << " at line " << lineIdx << ": " << stripped << "\n";
+            return true;
+          }
+        }
+      }
+      return false;
+    };
+
+    bool srcBOverwritten = false;
+    for (int i = 0; i <= lastMfmaLine && !srcBOverwritten; i++) {
+      if (trackedLines.count(i))
+        continue;
+      std::string stripped = lines[i].text;
+      size_t cpos = stripped.find("//");
+      if (cpos != std::string::npos)
+        stripped = stripped.substr(0, cpos);
+
+      // Detect ANY instruction that writes to a VGPR
+      bool isVGPRWrite = false;
+      // Loads (buffer_load without lds, global_load, flat_load)
+      if (stripped.find("buffer_load") != std::string::npos &&
+          stripped.find(" lds") == std::string::npos)
+        isVGPRWrite = true;
+      if (stripped.find("global_load") != std::string::npos ||
+          stripped.find("flat_load") != std::string::npos)
+        isVGPRWrite = true;
+      // VALU writes (v_* except v_mfma which is tracked)
+      if (!isVGPRWrite && stripped.find("v_") != std::string::npos)
+        isVGPRWrite = true;
+      // ds_permute writes to first VGPR operand
+      if (stripped.find("ds_permute") != std::string::npos)
+        isVGPRWrite = true;
+
+      if (!isVGPRWrite)
+        continue;
+
+      srcBOverwritten = checkVGPRConflict(stripped, i);
+    }
+
+    if (srcBOverwritten) {
+      llvm::errs() << "  SKIPPING body " << bodiesProcessed
+                   << " due to SrcB register overwrite\n";
+      bodiesProcessed++;
+      searchPos = endLineStart;
+      continue;
+    }
+
     // Apply in-place modifications: change MFMA operands and ds_read offsets
     int modified = 0;
     for (int j = 0; j < 16; j++) {
@@ -1207,28 +1328,971 @@ static std::string restructureGEMM2(std::string loop,
   return loop;
 }
 
+// --- Pass: restructureGEMM2_V4 ---
+// Reorder instructions: group ds_reads into 4-read batches, each batch
+// followed by 4 MFMAs that consume them (same SrcC, back-to-back).
+// Filler is kept in original order between groups 0 and 1.
+// SrcC transition gaps for groups 1-3 are padded with s_nop.
+static std::string restructureGEMM2_V4(std::string loop,
+                                       const std::string &label) {
+  auto extractVGPRRange = [](const std::string &s,
+                             size_t startFrom) -> std::string {
+    size_t pos = s.find("v[", startFrom);
+    if (pos == std::string::npos)
+      return "";
+    size_t end = s.find(']', pos);
+    if (end == std::string::npos)
+      return "";
+    return s.substr(pos, end - pos + 1);
+  };
+
+  size_t searchPos = 0;
+  int bodiesProcessed = 0;
+
+  while (true) {
+    size_t sp0 = loop.find("s_setprio 0", searchPos);
+    if (sp0 == std::string::npos)
+      break;
+    size_t sp0LineEnd = loop.find('\n', sp0);
+    if (sp0LineEnd == std::string::npos)
+      break;
+    sp0LineEnd++;
+
+    size_t endMarker = loop.find("v_pk_mul_f32", sp0LineEnd);
+    size_t nextBarrier = loop.find("s_barrier", sp0LineEnd);
+    if (endMarker == std::string::npos && nextBarrier == std::string::npos) {
+      searchPos = sp0LineEnd;
+      continue;
+    }
+    if (endMarker == std::string::npos ||
+        (nextBarrier != std::string::npos && nextBarrier < endMarker))
+      endMarker = nextBarrier;
+
+    size_t endLineStart = loop.rfind('\n', endMarker);
+    if (endLineStart == std::string::npos)
+      endLineStart = 0;
+    else
+      endLineStart++;
+
+    std::string region = loop.substr(sp0LineEnd, endLineStart - sp0LineEnd);
+
+    struct LineInfo {
+      std::string text;
+    };
+    std::vector<LineInfo> lines;
+    {
+      size_t pos = 0;
+      while (pos < region.size()) {
+        size_t eol = region.find('\n', pos);
+        if (eol == std::string::npos) {
+          if (pos < region.size())
+            lines.push_back({region.substr(pos)});
+          break;
+        }
+        lines.push_back({region.substr(pos, eol - pos + 1)});
+        pos = eol + 1;
+      }
+    }
+
+    struct MFMAEntry {
+      int lineIdx;
+      std::string dest, srcA, srcB;
+    };
+    struct DSReadEntry {
+      int lineIdx;
+      std::string dest;
+      int offset;
+    };
+
+    std::vector<MFMAEntry> mfmas;
+    std::vector<DSReadEntry> dsReads;
+
+    for (int i = 0; i < (int)lines.size(); i++) {
+      std::string stripped = lines[i].text;
+      size_t cpos = stripped.find("//");
+      if (cpos != std::string::npos)
+        stripped = stripped.substr(0, cpos);
+
+      if (stripped.find("v_mfma_f32_32x32x8_bf16") != std::string::npos) {
+        MFMAEntry m;
+        m.lineIdx = i;
+        m.dest = extractVGPRRange(stripped, 0);
+        size_t after1 = stripped.find(']') + 1;
+        m.srcA = extractVGPRRange(stripped, after1);
+        size_t after2 =
+            stripped.find(']', stripped.find("v[", after1)) + 1;
+        m.srcB = extractVGPRRange(stripped, after2);
+        if (!m.dest.empty() && !m.srcA.empty() && !m.srcB.empty())
+          mfmas.push_back(m);
+      } else if (stripped.find("ds_read_b64") != std::string::npos) {
+        DSReadEntry d;
+        d.lineIdx = i;
+        d.dest = extractVGPRRange(stripped, 0);
+        size_t offPos = stripped.find("offset:");
+        d.offset = (offPos != std::string::npos)
+                       ? atoi(stripped.substr(offPos + 7).c_str())
+                       : -1;
+        dsReads.push_back(d);
+      }
+    }
+
+    if (mfmas.size() != 16 || dsReads.size() < 16) {
+      searchPos = endLineStart;
+      continue;
+    }
+
+    // Build accOrder and verify 4 groups of 4
+    std::vector<std::string> accOrder;
+    std::map<std::string, int> accCount;
+    for (auto &m : mfmas) {
+      accCount[m.dest]++;
+      if (std::find(accOrder.begin(), accOrder.end(), m.dest) ==
+          accOrder.end())
+        accOrder.push_back(m.dest);
+    }
+    if (accOrder.size() != 4) {
+      searchPos = endLineStart;
+      continue;
+    }
+    bool valid = true;
+    for (auto &a : accOrder)
+      if (accCount[a] != 4)
+        valid = false;
+    if (!valid) {
+      searchPos = endLineStart;
+      continue;
+    }
+
+    // Determine SrcB registers per column (from acc0's 4 MFMAs)
+    std::vector<std::string> srcBRegs;
+    for (auto &m : mfmas) {
+      if (m.dest == accOrder[0])
+        srcBRegs.push_back(m.srcB);
+    }
+    if (srcBRegs.size() != 4) {
+      searchPos = endLineStart;
+      continue;
+    }
+
+    // Verify all acc groups use the same SrcB order
+    for (size_t ai = 1; ai < 4 && valid; ai++) {
+      int ci = 0;
+      for (auto &m : mfmas) {
+        if (m.dest == accOrder[ai]) {
+          if (m.srcB != srcBRegs[ci]) {
+            valid = false;
+            break;
+          }
+          ci++;
+        }
+      }
+    }
+    if (!valid) {
+      searchPos = endLineStart;
+      continue;
+    }
+
+    // Determine original (accIdx, colIdx) for each MFMA
+    struct Assignment {
+      int accIdx, colIdx;
+    };
+    std::vector<Assignment> origAssign(16);
+    {
+      std::map<std::string, int> accColCounter;
+      for (int j = 0; j < 16; j++) {
+        int ai = 0;
+        for (int k = 0; k < 4; k++)
+          if (mfmas[j].dest == accOrder[k])
+            ai = k;
+        int ci = accColCounter[mfmas[j].dest]++;
+        origAssign[j] = {ai, ci};
+      }
+    }
+
+    // Build feed_map and inverse feed_map (same as V1)
+    std::vector<int> feedMap(16, -1);
+    {
+      std::map<std::string, int> pendingDsRead;
+      int mfmaSeq = 0;
+      int dsReadSeq = 0;
+      for (int i = 0; i < (int)lines.size(); i++) {
+        if (dsReadSeq < 16 && dsReads[dsReadSeq].lineIdx == i) {
+          pendingDsRead[dsReads[dsReadSeq].dest] = dsReadSeq;
+          dsReadSeq++;
+        }
+        if (mfmaSeq < 16 && mfmas[mfmaSeq].lineIdx == i) {
+          auto it = pendingDsRead.find(mfmas[mfmaSeq].srcA);
+          if (it != pendingDsRead.end()) {
+            feedMap[it->second] = mfmaSeq;
+            pendingDsRead.erase(it);
+          }
+          mfmaSeq++;
+        }
+      }
+    }
+
+    for (int i = 0; i < 16; i++) {
+      if (feedMap[i] < 0) {
+        valid = false;
+        break;
+      }
+    }
+    if (!valid) {
+      searchPos = endLineStart;
+      continue;
+    }
+
+    std::vector<int> invFeed(16, -1);
+    for (int i = 0; i < 16; i++)
+      invFeed[feedMap[i]] = i;
+
+    // Compute pBase and accStride
+    int pBase[4];
+    for (int c = 0; c < 4; c++) {
+      for (int j = 0; j < 16; j++) {
+        if (origAssign[j].accIdx == 0 && origAssign[j].colIdx == c) {
+          pBase[c] = dsReads[invFeed[j]].offset;
+          break;
+        }
+      }
+    }
+
+    int accStride = 128;
+    {
+      for (int j = 0; j < 16; j++) {
+        if (origAssign[j].accIdx == 1 && origAssign[j].colIdx == 0) {
+          int off = dsReads[invFeed[j]].offset;
+          int candidate = off - pBase[0];
+          if (candidate > 0 && candidate < 1024)
+            accStride = candidate;
+          break;
+        }
+      }
+    }
+
+    // Verify offset formula
+    bool offsetFormulaOK = true;
+    for (int j = 0; j < 16; j++) {
+      int dsIdx = invFeed[j];
+      int actualOff = dsReads[dsIdx].offset;
+      int expectedOff = pBase[origAssign[j].colIdx] +
+                        origAssign[j].accIdx * accStride;
+      if (actualOff != expectedOff) {
+        offsetFormulaOK = false;
+        break;
+      }
+    }
+    if (!offsetFormulaOK) {
+      llvm::errs() << "[restructureGEMM2_V4] SKIP body " << bodiesProcessed
+                   << " in " << label << ": offset formula mismatch\n";
+      bodiesProcessed++;
+      searchPos = endLineStart;
+      continue;
+    }
+
+    // Extract address register from first ds_read (e.g., "v126")
+    std::string addrReg;
+    {
+      std::string &firstRead = lines[dsReads[0].lineIdx].text;
+      size_t commaPos = firstRead.find(',');
+      if (commaPos != std::string::npos) {
+        size_t addrStart = firstRead.find_first_not_of(" \t", commaPos + 1);
+        size_t addrEnd = firstRead.find_first_of(" \t", addrStart);
+        if (addrStart != std::string::npos && addrEnd != std::string::npos)
+          addrReg = firstRead.substr(addrStart, addrEnd - addrStart);
+      }
+    }
+    if (addrReg.empty()) {
+      searchPos = endLineStart;
+      continue;
+    }
+
+    // Check SrcB register overwrites between first and last MFMA
+    std::set<int> srcBVGPRs;
+    for (auto &s : srcBRegs) {
+      size_t lb = s.find('[');
+      size_t colon = s.find(':');
+      size_t rb = s.find(']');
+      if (lb != std::string::npos && colon != std::string::npos &&
+          rb != std::string::npos) {
+        int lo = atoi(s.substr(lb + 1, colon - lb - 1).c_str());
+        int hi = atoi(s.substr(colon + 1, rb - colon - 1).c_str());
+        for (int r = lo; r <= hi; r++)
+          srcBVGPRs.insert(r);
+      }
+    }
+
+    // For V4: SrcB must not be overwritten by ANY filler instruction
+    // (since all filler runs before groups 1-3 which use SrcB)
+    std::set<int> trackedLines;
+    for (auto &m : mfmas)
+      trackedLines.insert(m.lineIdx);
+    for (int d = 0; d < 16; d++)
+      trackedLines.insert(dsReads[d].lineIdx);
+
+    bool srcBOverwritten = false;
+    int lastMfmaLine = mfmas.back().lineIdx;
+    for (int i = 0; i <= lastMfmaLine && !srcBOverwritten; i++) {
+      if (trackedLines.count(i))
+        continue;
+      std::string stripped = lines[i].text;
+      size_t cpos = stripped.find("//");
+      if (cpos != std::string::npos)
+        stripped = stripped.substr(0, cpos);
+
+      bool isVGPRWrite = false;
+      if (stripped.find("buffer_load") != std::string::npos &&
+          stripped.find(" lds") == std::string::npos)
+        isVGPRWrite = true;
+      if (stripped.find("global_load") != std::string::npos ||
+          stripped.find("flat_load") != std::string::npos)
+        isVGPRWrite = true;
+      if (!isVGPRWrite && stripped.find("v_") != std::string::npos)
+        isVGPRWrite = true;
+      if (stripped.find("ds_permute") != std::string::npos)
+        isVGPRWrite = true;
+      if (!isVGPRWrite)
+        continue;
+
+      // Check range dest
+      std::string dest = extractVGPRRange(stripped, 0);
+      if (!dest.empty()) {
+        size_t lb = dest.find('[');
+        size_t colon = dest.find(':');
+        size_t rb = dest.find(']');
+        if (lb != std::string::npos && colon != std::string::npos &&
+            rb != std::string::npos) {
+          int lo = atoi(dest.substr(lb + 1, colon - lb - 1).c_str());
+          int hi = atoi(dest.substr(colon + 1, rb - colon - 1).c_str());
+          for (int r = lo; r <= hi; r++) {
+            if (srcBVGPRs.count(r)) {
+              llvm::errs() << "[restructureGEMM2_V4] SrcB CONFLICT v" << r
+                           << " at line " << i << "\n";
+              srcBOverwritten = true;
+            }
+          }
+        }
+      } else {
+        size_t vpos = stripped.find(" v");
+        if (vpos != std::string::npos) {
+          vpos++;
+          size_t numStart = vpos + 1;
+          size_t numEnd = numStart;
+          while (numEnd < stripped.size() && isdigit(stripped[numEnd]))
+            numEnd++;
+          if (numEnd > numStart) {
+            int vgpr =
+                atoi(stripped.substr(numStart, numEnd - numStart).c_str());
+            if (srcBVGPRs.count(vgpr)) {
+              llvm::errs() << "[restructureGEMM2_V4] SrcB CONFLICT v" << vgpr
+                           << " at line " << i << "\n";
+              srcBOverwritten = true;
+            }
+          }
+        }
+      }
+    }
+
+    if (srcBOverwritten) {
+      llvm::errs() << "[restructureGEMM2_V4] SKIP body " << bodiesProcessed
+                   << " in " << label << " due to SrcB overwrite\n";
+      bodiesProcessed++;
+      searchPos = endLineStart;
+      continue;
+    }
+
+    // Scan filler for VGPR writes to build "unsafe" register set
+    std::set<int> unsafeVGPRs;
+    for (int i = 0; i < (int)lines.size(); i++) {
+      if (trackedLines.count(i))
+        continue;
+      std::string stripped = lines[i].text;
+      size_t cpos = stripped.find("//");
+      if (cpos != std::string::npos)
+        stripped = stripped.substr(0, cpos);
+      if (stripped.find("v_") == std::string::npos &&
+          stripped.find("ds_permute") == std::string::npos &&
+          stripped.find("buffer_load") == std::string::npos)
+        continue;
+      // Extract dest VGPR
+      std::string dest = extractVGPRRange(stripped, 0);
+      if (!dest.empty()) {
+        size_t lb = dest.find('[');
+        size_t colon = dest.find(':');
+        size_t rb = dest.find(']');
+        if (lb != std::string::npos && colon != std::string::npos &&
+            rb != std::string::npos) {
+          int lo = atoi(dest.substr(lb + 1, colon - lb - 1).c_str());
+          int hi = atoi(dest.substr(colon + 1, rb - colon - 1).c_str());
+          for (int r = lo; r <= hi; r++)
+            unsafeVGPRs.insert(r);
+        }
+      } else {
+        size_t vpos = stripped.find(" v");
+        if (vpos != std::string::npos) {
+          vpos++;
+          size_t numStart = vpos + 1;
+          size_t numEnd = numStart;
+          while (numEnd < stripped.size() && isdigit(stripped[numEnd]))
+            numEnd++;
+          if (numEnd > numStart) {
+            int vgpr =
+                atoi(stripped.substr(numStart, numEnd - numStart).c_str());
+            unsafeVGPRs.insert(vgpr);
+          }
+        }
+      }
+    }
+
+    // Choose 4 even-aligned register pairs from existing read dests that
+    // are NOT in the unsafe set
+    std::set<std::string> allReadDests;
+    for (int d = 0; d < 16; d++)
+      allReadDests.insert(dsReads[d].dest);
+
+    std::vector<std::string> readPairs;
+    for (auto &rd : allReadDests) {
+      size_t lb = rd.find('[');
+      size_t colon = rd.find(':');
+      if (lb == std::string::npos || colon == std::string::npos)
+        continue;
+      int lo = atoi(rd.substr(lb + 1, colon - lb - 1).c_str());
+      int hi = lo + 1;
+      if (lo % 2 != 0)
+        continue;
+      if (unsafeVGPRs.count(lo) || unsafeVGPRs.count(hi))
+        continue;
+      readPairs.push_back(rd);
+      if (readPairs.size() == 4)
+        break;
+    }
+
+    if (readPairs.size() < 4) {
+      llvm::errs() << "[restructureGEMM2_V4] SKIP body " << bodiesProcessed
+                   << " in " << label << ": only " << readPairs.size()
+                   << " safe register pairs found\n";
+      bodiesProcessed++;
+      searchPos = endLineStart;
+      continue;
+    }
+
+    // Separate filler into mainFiller (before/between MFMAs) and
+    // postFiller (after last MFMA: v_exp, s_nop)
+    std::vector<std::string> mainFiller, postFiller;
+    bool pastLastMfma = false;
+    for (int i = 0; i < (int)lines.size(); i++) {
+      if (i > lastMfmaLine)
+        pastLastMfma = true;
+      if (trackedLines.count(i))
+        continue;
+      if (pastLastMfma) {
+        postFiller.push_back(lines[i].text);
+      } else {
+        mainFiller.push_back(lines[i].text);
+      }
+    }
+
+    llvm::errs() << "[restructureGEMM2_V4] Body " << bodiesProcessed << " in "
+                 << label << "\n";
+    llvm::errs() << "  accOrder:";
+    for (auto &a : accOrder)
+      llvm::errs() << " " << a;
+    llvm::errs() << "\n  srcBRegs:";
+    for (auto &s : srcBRegs)
+      llvm::errs() << " " << s;
+    llvm::errs() << "\n  readPairs:";
+    for (auto &rp : readPairs)
+      llvm::errs() << " " << rp;
+    llvm::errs() << "\n  pBase=[" << pBase[0] << "," << pBase[1] << ","
+                 << pBase[2] << "," << pBase[3]
+                 << "] accStride=" << accStride << "\n";
+    llvm::errs() << "  mainFiller: " << mainFiller.size()
+                 << " lines, postFiller: " << postFiller.size() << " lines\n";
+
+    // Generate restructured region (V5 layout):
+    // Group 0: reads → lgkmcnt(3) → MFMAs → filler
+    // Groups 1-3: reads → 5 s_nop (SrcC padding) → lgkmcnt(3) → MFMAs
+    // lgkmcnt(3) waits for oldest read only; MFMA exec hides remaining reads.
+    std::string newRegion;
+
+    for (int g = 0; g < 4; g++) {
+      // Emit 4 ds_reads for this accumulator group
+      for (int c = 0; c < 4; c++) {
+        int offset = pBase[c] + g * accStride;
+        newRegion += "\tds_read_b64 " + readPairs[c] + ", " + addrReg +
+                     " offset:" + std::to_string(offset) + "\n";
+      }
+
+      if (g > 0) {
+        // Groups 1-3: SrcC transition padding before MFMAs.
+        // 4 reads (just emitted) + 5 s_nop = 9 instructions for SrcC gap.
+        for (int n = 0; n < 5; n++)
+          newRegion += "\ts_nop 0\n";
+      }
+
+      // lgkmcnt(3): wait for oldest read only. The remaining 3 reads
+      // complete during the first MFMA's 32-cycle execution window.
+      newRegion += "\ts_waitcnt lgkmcnt(3)\n";
+
+      // Emit 4 MFMAs (back-to-back, same SrcC)
+      for (int c = 0; c < 4; c++) {
+        newRegion += "\tv_mfma_f32_32x32x8_bf16 " + accOrder[g] + ", " +
+                     readPairs[c] + ", " + srcBRegs[c] + ", " + accOrder[g] +
+                     "\n";
+      }
+
+      // After group 0: emit ALL main filler in original order
+      if (g == 0) {
+        for (auto &fl : mainFiller)
+          newRegion += fl;
+      }
+    }
+
+    // Emit post-filler (v_exp, s_nop 6, etc.)
+    for (auto &pf : postFiller)
+      newRegion += pf;
+
+    // Replace region
+    loop.replace(sp0LineEnd, endLineStart - sp0LineEnd, newRegion);
+    searchPos = sp0LineEnd + newRegion.size();
+    bodiesProcessed++;
+    llvm::errs() << "  APPLIED V4 restructuring\n";
+  }
+
+  if (bodiesProcessed > 0)
+    llvm::errs() << "[postProcessISA] restructureGEMM2_V4: processed "
+                 << bodiesProcessed << " bodies in " << label << "\n";
+
+  return loop;
+}
+
+// --- Pass: restructureGEMM2_V3 ---
+// Remap ds_read destinations to unique even-aligned registers, then reorder
+// ds_reads + MFMAs into accumulator-grouped blocks with filler interleaved.
+// Group N reads are issued before Group N-1 MFMAs (latency hidden by filler).
+// Eliminates ~6 lgkmcnt stalls per body + reduces SrcC transition penalties.
+static std::string restructureGEMM2_V3(std::string loop, const std::string &label,
+                                       int &maxNewVgprOut) {
+  int bodiesProcessed = 0;
+  int maxNewVgpr = 0;
+
+  size_t searchPos = 0;
+  while (true) {
+    size_t sp0 = loop.find("s_setprio 0\n", searchPos);
+    if (sp0 == std::string::npos) break;
+
+    size_t mfmaBefore = loop.rfind("v_mfma_f32_32x32x8_bf16", sp0);
+    if (mfmaBefore == std::string::npos || sp0 - mfmaBefore > 300) {
+      searchPos = sp0 + 12;
+      continue;
+    }
+
+    size_t asmEnd = loop.find(";;#ASMEND", sp0);
+    if (asmEnd == std::string::npos) { searchPos = sp0 + 12; continue; }
+    size_t regionStart = loop.find('\n', asmEnd);
+    if (regionStart == std::string::npos) break;
+    regionStart++;
+
+    // Region ends at v_exp_f32 (correction factor computation, must stay after MFMAs)
+    size_t vexpPos = std::string::npos;
+    {
+      size_t p = regionStart;
+      // Find v_exp_f32 that comes after MFMA instructions (the O correction exp)
+      size_t lastMfma = regionStart;
+      while (true) {
+        size_t m = loop.find("v_mfma_f32_32x32x8_bf16", lastMfma + 1);
+        if (m == std::string::npos || m > regionStart + 8000) break;
+        // Check this MFMA is before the next s_setprio or s_barrier
+        size_t nextSP = loop.find("s_setprio", m);
+        size_t nextBar = loop.find("s_barrier", m);
+        size_t boundary = std::min(nextSP, nextBar);
+        if (boundary != std::string::npos && boundary < m) break;
+        lastMfma = m;
+      }
+      // Find v_exp_f32 after the last MFMA
+      size_t ve = loop.find("v_exp_f32", lastMfma);
+      if (ve != std::string::npos) {
+        size_t veLineStart = loop.rfind('\n', ve);
+        vexpPos = (veLineStart == std::string::npos) ? ve : veLineStart + 1;
+      }
+    }
+    if (vexpPos == std::string::npos || vexpPos <= regionStart) {
+      searchPos = sp0 + 12;
+      continue;
+    }
+    size_t regionEnd = vexpPos;
+
+    std::string region = loop.substr(regionStart, regionEnd - regionStart);
+
+    // Parse all lines
+    struct Line {
+      std::string text;
+      int type; // 0=ds_read, 1=mfma, 2=lgkmcnt, 3=other
+      int destReg, offset;   // ds_read
+      int accReg, srcAReg, srcBReg; // mfma
+    };
+    std::vector<Line> allLines;
+    {
+      size_t pos = 0;
+      while (pos < region.size()) {
+        size_t eol = region.find('\n', pos);
+        if (eol == std::string::npos) eol = region.size();
+        std::string lt = region.substr(pos, eol - pos);
+        Line L;
+        L.text = lt; L.type = 3;
+        L.destReg = -1; L.offset = 0;
+        L.accReg = -1; L.srcAReg = -1; L.srcBReg = -1;
+
+        if (lt.find("ds_read_b64 v[") != std::string::npos) {
+          L.type = 0;
+          size_t vs = lt.find("v[") + 2;
+          L.destReg = atoi(lt.c_str() + vs);
+          size_t os = lt.find("offset:");
+          if (os != std::string::npos) L.offset = atoi(lt.c_str() + os + 7);
+        } else if (lt.find("v_mfma_f32_32x32x8_bf16") != std::string::npos) {
+          L.type = 1;
+          std::vector<int> vr;
+          size_t vp = 0;
+          while (true) {
+            size_t v = lt.find("v[", vp);
+            if (v == std::string::npos) break;
+            vr.push_back(atoi(lt.c_str() + v + 2));
+            vp = v + 2;
+          }
+          if (vr.size() >= 4) {
+            L.accReg = vr[0]; L.srcAReg = vr[1]; L.srcBReg = vr[2];
+          }
+        } else if (lt.find("s_waitcnt lgkmcnt(") != std::string::npos) {
+          L.type = 2;
+        }
+        allLines.push_back(L);
+        pos = eol + 1;
+      }
+    }
+
+    // Collect ds_reads and MFMAs
+    struct DSRead { int idx; std::string text; int destReg; int offset; int accGroup; };
+    struct MFMA { int idx; std::string text; int accReg; int srcAReg; int srcBReg; int accGroup; };
+    std::vector<DSRead> reads;
+    std::vector<MFMA> mfmas;
+    for (int i = 0; i < (int)allLines.size(); i++) {
+      if (allLines[i].type == 0)
+        reads.push_back({i, allLines[i].text, allLines[i].destReg, allLines[i].offset, -1});
+      else if (allLines[i].type == 1)
+        mfmas.push_back({i, allLines[i].text, allLines[i].accReg, allLines[i].srcAReg, allLines[i].srcBReg, -1});
+    }
+
+    if ((int)reads.size() < 16 || (int)mfmas.size() < 16) {
+      searchPos = regionEnd; continue;
+    }
+
+    // Simulate register tracking to pair ds_reads with MFMAs
+    std::map<int, int> liveReg; // reg -> ds_read index in `reads`
+    int readIdx = 0, mfmaIdx = 0;
+    std::map<int, int> mfmaToRead; // mfma index -> read index
+    for (int i = 0; i < (int)allLines.size(); i++) {
+      if (allLines[i].type == 0 && readIdx < (int)reads.size()) {
+        liveReg[reads[readIdx].destReg] = readIdx;
+        readIdx++;
+      } else if (allLines[i].type == 1 && mfmaIdx < (int)mfmas.size()) {
+        auto it = liveReg.find(mfmas[mfmaIdx].srcAReg);
+        if (it != liveReg.end())
+          mfmaToRead[mfmaIdx] = it->second;
+        mfmaIdx++;
+      }
+    }
+
+    // Determine accumulator groups: unique accReg values in MFMA order
+    std::vector<int> accOrder;
+    std::map<int, int> accToGroup;
+    for (auto &m : mfmas) {
+      if (accToGroup.find(m.accReg) == accToGroup.end()) {
+        int g = (int)accOrder.size();
+        accToGroup[m.accReg] = g;
+        accOrder.push_back(m.accReg);
+      }
+      m.accGroup = accToGroup[m.accReg];
+    }
+    if ((int)accOrder.size() != 4) { searchPos = regionEnd; continue; }
+
+    // Assign accGroup to reads via mfmaToRead mapping
+    for (int mi = 0; mi < (int)mfmas.size(); mi++) {
+      auto it = mfmaToRead.find(mi);
+      if (it != mfmaToRead.end())
+        reads[it->second].accGroup = mfmas[mi].accGroup;
+    }
+
+    // Group reads and MFMAs by accGroup
+    std::vector<DSRead> groupReads[4];
+    std::vector<MFMA> groupMfmas[4];
+    for (auto &r : reads) if (r.accGroup >= 0 && r.accGroup < 4) groupReads[r.accGroup].push_back(r);
+    for (auto &m : mfmas) if (m.accGroup >= 0 && m.accGroup < 4) groupMfmas[m.accGroup].push_back(m);
+
+    // Verify: each group should have 4 reads and 4 MFMAs
+    bool valid = true;
+    for (int g = 0; g < 4; g++)
+      if ((int)groupReads[g].size() != 4 || (int)groupMfmas[g].size() != 4) valid = false;
+    if (!valid) { searchPos = regionEnd; continue; }
+
+    // Assign unique even-aligned registers for groups 1-3 (group 0 keeps originals)
+    // Build pool of even-aligned regs not used in this body
+    std::set<int> usedRegs;
+    for (auto &L : allLines) {
+      size_t vp = 0;
+      while (true) {
+        size_t v = L.text.find("v[", vp);
+        if (v == std::string::npos) break;
+        int r = atoi(L.text.c_str() + v + 2);
+        usedRegs.insert(r); usedRegs.insert(r+1);
+        if (L.text.size() > v+2) {
+          size_t colon = L.text.find(':', v+2);
+          if (colon != std::string::npos) {
+            int r2 = atoi(L.text.c_str() + colon + 1);
+            for (int x = r; x <= r2; x++) usedRegs.insert(x);
+          }
+        }
+        vp = v + 2;
+      }
+      // Also check bare vN references
+      for (int r = 0; r < 256; r++) {
+        std::string pat = "v" + std::to_string(r);
+        if (L.text.find(pat + ",") != std::string::npos ||
+            L.text.find(pat + " ") != std::string::npos)
+          usedRegs.insert(r);
+      }
+    }
+
+    // Find free even-aligned pairs (checking full kernel scope would be better but
+    // this is conservative enough for the GEMM2 region)
+    std::vector<int> freePool;
+    for (int r = 220; r <= 252; r += 2) {
+      if (usedRegs.find(r) == usedRegs.end() && usedRegs.find(r+1) == usedRegs.end())
+        freePool.push_back(r);
+    }
+
+    // Need up to 12 free pairs (4 per group × 3 groups to remap)
+    // But some reads in groups 1-3 might already have unique registers
+    int poolUsed = 0;
+    for (int g = 1; g < 4; g++) {
+      for (auto &r : groupReads[g]) {
+        // Check if this register is used by another read in any group
+        bool needsRemap = false;
+        for (int g2 = 0; g2 < 4; g2++) {
+          if (g2 == g) continue;
+          for (auto &r2 : groupReads[g2]) {
+            if (r2.destReg == r.destReg) { needsRemap = true; break; }
+          }
+          if (needsRemap) break;
+        }
+        // Also check if used by another read in same group
+        if (!needsRemap) {
+          for (auto &r2 : groupReads[g]) {
+            if (&r2 != &r && r2.destReg == r.destReg) { needsRemap = true; break; }
+          }
+        }
+
+        if (needsRemap && poolUsed < (int)freePool.size()) {
+          int newReg = freePool[poolUsed++];
+          if (newReg + 2 > maxNewVgpr) maxNewVgpr = newReg + 2;
+
+          std::string oldS = "v[" + std::to_string(r.destReg) + ":" + std::to_string(r.destReg+1) + "]";
+          std::string newS = "v[" + std::to_string(newReg) + ":" + std::to_string(newReg+1) + "]";
+
+          // Update read text
+          size_t rp = r.text.find(oldS);
+          if (rp != std::string::npos) r.text.replace(rp, oldS.size(), newS);
+
+          // Update corresponding MFMA SrcA
+          for (auto &m : groupMfmas[g]) {
+            if (m.srcAReg == r.destReg) {
+              size_t fv = m.text.find("v[");
+              if (fv != std::string::npos) {
+                size_t sv = m.text.find(oldS, fv + 1);
+                if (sv != std::string::npos) {
+                  m.text.replace(sv, oldS.size(), newS);
+                  m.srcAReg = newReg;
+                }
+              }
+              break; // only update one MFMA per read
+            }
+          }
+          r.destReg = newReg;
+        }
+      }
+    }
+
+    // Classify filler instructions (everything that's not ds_read, mfma, or lgkmcnt)
+    // Split into categories for interleaving between groups
+    std::set<int> dsReadIdxs, mfmaIdxs;
+    for (auto &r : reads) dsReadIdxs.insert(r.idx);
+    for (auto &m : mfmas) mfmaIdxs.insert(m.idx);
+
+    // Collect filler in original order, classifying by pattern
+    struct Filler { std::string text; int cat; };
+    // cat: 0=mask(v_cmp/v_cndmask), 1=rowmax(v_max3 before permute), 2=ds_permute,
+    //      3=softmax(after permute), 4=pkfma, 5=buf_load(non-lds), 6=buf_load_lds_block,
+    //      7=addr/salu, 8=vmcnt
+    std::vector<Filler> fillers;
+    bool seenPermute = false;
+    bool seenPkFma = false;
+    int max3Count = 0;
+    for (int i = 0; i < (int)allLines.size(); i++) {
+      if (dsReadIdxs.count(i) || mfmaIdxs.count(i) || allLines[i].type == 2) continue;
+      std::string &t = allLines[i].text;
+      std::string tl = t;
+      for (auto &c : tl) c = tolower(c);
+      int cat = 7; // default: addr/salu
+      if (tl.find("v_cmp_") != std::string::npos || tl.find("v_cndmask") != std::string::npos)
+        cat = 0;
+      else if (tl.find("v_max3_f32") != std::string::npos) {
+        max3Count++;
+        if (!seenPermute) cat = 1; else cat = 3;
+      }
+      else if (tl.find("ds_permute") != std::string::npos) { cat = 2; seenPermute = true; }
+      else if (tl.find("v_sub_f32") != std::string::npos || tl.find("v_mul_f32") != std::string::npos ||
+               tl.find("v_max_f32") != std::string::npos || tl.find("v_min_f32") != std::string::npos) {
+        if (seenPermute && !seenPkFma) cat = 3;
+      }
+      else if (tl.find("v_pk_fma") != std::string::npos) { cat = 4; seenPkFma = true; }
+      else if (tl.find("buffer_load") != std::string::npos && tl.find("lds") != std::string::npos) cat = 6;
+      else if (tl.find("buffer_load") != std::string::npos && tl.find("lds") == std::string::npos) cat = 5;
+      else if (tl.find("s_waitcnt vmcnt") != std::string::npos) cat = 8;
+      fillers.push_back({t, cat});
+    }
+
+    // Retroactively mark s_mov/s_nop/v_add adjacent to buffer_load_lds as cat=6
+    // to keep the entire buffer_load_lds block together (m0 + offset + lds load)
+    for (int i = 0; i < (int)fillers.size(); i++) {
+      if (fillers[i].cat == 6) {
+        // Mark preceding s_mov/s_nop/v_add as cat=6
+        for (int j = i - 1; j >= 0; j--) {
+          std::string tl = fillers[j].text;
+          for (auto &c : tl) c = tolower(c);
+          if (tl.find("s_mov_b32 m0") != std::string::npos ||
+              tl.find("s_nop") != std::string::npos ||
+              tl.find("v_add_u32") != std::string::npos) {
+            fillers[j].cat = 6;
+          } else {
+            break;
+          }
+        }
+      }
+    }
+
+    // Collect filler by category
+    std::vector<std::string> maskFiller, rowmaxFiller, permuteFiller, softmaxFiller;
+    std::vector<std::string> pkfmaFiller, bufLoadFiller, bufLdsFiller, addrFiller, vmcntFiller;
+    for (auto &f : fillers) {
+      switch (f.cat) {
+        case 0: maskFiller.push_back(f.text); break;
+        case 1: rowmaxFiller.push_back(f.text); break;
+        case 2: permuteFiller.push_back(f.text); break;
+        case 3: softmaxFiller.push_back(f.text); break;
+        case 4: pkfmaFiller.push_back(f.text); break;
+        case 5: bufLoadFiller.push_back(f.text); break;
+        case 6: bufLdsFiller.push_back(f.text); break;
+        case 7: addrFiller.push_back(f.text); break;
+        case 8: vmcntFiller.push_back(f.text); break;
+      }
+    }
+
+    // Build restructured region
+    std::string newRegion;
+    auto emitLines = [&](const std::vector<std::string> &lines) {
+      for (auto &l : lines) newRegion += l + "\n";
+    };
+    auto emitReads = [&](int g) {
+      for (auto &r : groupReads[g]) newRegion += r.text + "\n";
+    };
+    auto emitMfmas = [&](int g) {
+      for (auto &m : groupMfmas[g]) newRegion += m.text + "\n";
+    };
+
+    // Group 0: reads → mask filler → lgkmcnt(0) → MFMAs
+    emitReads(0);
+    emitLines(maskFiller);
+    emitLines(addrFiller);
+    newRegion += "\ts_waitcnt lgkmcnt(0)\n";
+    emitMfmas(0);
+
+    // Group 1: reads → rowmax+permute → lgkmcnt(0) → softmax → MFMAs
+    emitReads(1);
+    emitLines(rowmaxFiller);
+    emitLines(permuteFiller);
+    newRegion += "\ts_waitcnt lgkmcnt(0)\n";
+    emitLines(softmaxFiller);
+    emitMfmas(1);
+
+    // Group 2: reads → pkfma+vmcnt → lgkmcnt(0) → MFMAs
+    emitReads(2);
+    emitLines(vmcntFiller);
+    emitLines(pkfmaFiller);
+    newRegion += "\ts_waitcnt lgkmcnt(0)\n";
+    emitMfmas(2);
+
+    // Group 3: reads → buf_load → lgkmcnt(0) → MFMAs
+    emitReads(3);
+    emitLines(bufLoadFiller);
+    newRegion += "\ts_waitcnt lgkmcnt(0)\n";
+    emitMfmas(3);
+
+    // Buffer_load_lds block at end (for next iteration's K data)
+    emitLines(bufLdsFiller);
+
+    loop.replace(regionStart, regionEnd - regionStart, newRegion);
+    bodiesProcessed++;
+    searchPos = regionStart + newRegion.size();
+  }
+
+  if (maxNewVgpr > maxNewVgprOut) maxNewVgprOut = maxNewVgpr;
+
+  if (bodiesProcessed > 0)
+    llvm::errs() << "[postProcessISA] restructureGEMM2_V3: processed "
+                 << bodiesProcessed << " bodies, pool=" << maxNewVgpr
+                 << " in " << label << "\n";
+  return loop;
+}
+
 static std::string postProcessISA(const std::string &isa) {
   std::string result = isa;
 
-  // Find all inner loop labels with backward branch (s_cbranch_vccnz .LBBx_y)
+  // Find all inner loop labels with backward branch.
+  // Detect both s_cbranch_vccnz and s_branch (unconditional) patterns,
+  // since scf.if/else inside loops may change the backward branch type.
   std::vector<std::string> loopLabels;
+  // Also track which branch pattern was used for each label
+  std::map<std::string, std::string> loopBranchPattern;
   for (int fn = 0; fn <= 1; fn++) {
-    for (int bb = 0; bb <= 15; bb++) {
+    for (int bb = 0; bb <= 30; bb++) {
       std::string label = ".LBB" + std::to_string(fn) + "_" + std::to_string(bb);
       std::string labelColon = label + ":";
-      std::string branchTarget = "s_cbranch_vccnz " + label;
       size_t labelPos = result.find(labelColon);
-      if (labelPos != std::string::npos) {
-        size_t branchPos = result.find(branchTarget, labelPos);
-        if (branchPos != std::string::npos)
-          loopLabels.push_back(label);
+      if (labelPos == std::string::npos) continue;
+
+      // Try multiple backward branch patterns
+      std::vector<std::string> patterns = {
+        "s_cbranch_vccnz " + label,
+        "s_branch " + label,
+      };
+      for (const auto &pat : patterns) {
+        size_t branchPos = result.find(pat, labelPos);
+        if (branchPos != std::string::npos) {
+          // Verify exact match (not prefix, e.g. .LBB0_5 vs .LBB0_50)
+          size_t afterPat = branchPos + pat.size();
+          if (afterPat >= result.size() || result[afterPat] == '\n' ||
+              result[afterPat] == '\r') {
+            loopLabels.push_back(label);
+            loopBranchPattern[label] = pat;
+            break;
+          }
+        }
       }
     }
   }
 
   for (const auto &label : loopLabels) {
     std::string labelColon = label + ":";
-    std::string branchTarget = "s_cbranch_vccnz " + label;
+    std::string branchTarget = loopBranchPattern[label];
 
     size_t loopStart = result.find(labelColon);
     if (loopStart == std::string::npos)
@@ -1337,11 +2401,19 @@ static std::string postProcessISA(const std::string &isa) {
       }
     }
 
-    // Pass 8: Restructure GEMM2 MFMAs from column-cycling to [4,4,4,4] grouping
-    // DISABLED: Body 1 in .LBB0_10 has SrcB register (v[142:143]) overwritten
-    // by buffer_load_dword mid-region, causing correctness failures.
-    // TODO: implement SrcB save/restore before re-enabling.
-    // loop = restructureGEMM2(std::move(loop), label);
+    // Pass 7.5: DISABLED — Yield windows after s_setprio 0 regress
+    // (109T with 24cy, neutral with 4cy). MEM phase not separated from
+    // COMPUTE, so yield doesn't create overlap.
+
+    // Pass 8: DISABLED — V4 [4,4,4,4] grouping regresses to 106T.
+    // With 4 SrcC groups, lgkmcnt stalls + s_nop padding (95 cy/body) exceed
+    // SrcC transition savings (27 cy/body). Need ≤2 SrcC groups to benefit.
+    // loop = restructureGEMM2_V4(std::move(loop), label);
+
+    // Pass 9: DISABLED — V3 processes already-grouped Body A GEMM2 and breaks it.
+    //          The interleaved Body 2/5 sections are the real target but V3 skips them.
+    // static int g_maxNewVgpr = 0;
+    // loop = restructureGEMM2_V3(std::move(loop), label, g_maxNewVgpr);
 
     // --- Pass 10: Scalar branch to skip causal mask for non-boundary blocks ---
     // For "Body A" style mask blocks (v_cmp + v_cndmask + v_max3 interleaved,
@@ -1351,7 +2423,7 @@ static std::string postProcessISA(const std::string &isa) {
     unsigned maskBranchesAdded = 0;
     if (loopBarriers > 2) {
       size_t mSearchPos = 0;
-      while (true) {
+      while (maskBranchesAdded < 1) {
         // Find start of a Body-A mask block: v_cmp_lt_i32_e64 s[0:1], ...
         size_t firstCmp = loop.find("v_cmp_lt_i32_e64 s[0:1], ", mSearchPos);
         if (firstCmp == std::string::npos) break;
@@ -1433,8 +2505,86 @@ static std::string postProcessISA(const std::string &isa) {
           pos = le + 1;
         }
 
-        if (max3Lines.size() < 7 || lastMax3End == 0) {
-          mSearchPos = firstCmpLineEnd + 1; continue;
+        // --- Fallback: v_max3 not interleaved with v_cndmask ---
+        // In the current ISA layout, v_max3 appears AFTER MFMAs (not in the
+        // v_cmp+v_cndmask region). We skip the v_cmp+v_cndmask block entirely.
+        // Any non-mask instructions (buffer_load, s_mov, etc.) inside the
+        // skipped region are duplicated in the fast path to maintain correctness.
+        if (max3Lines.size() < 7) {
+          size_t lastCndEnd = 0;
+          int cndCount = 0;
+          std::vector<std::string> sideEffectLines;
+          pos = firstCmpLineStart;
+          scanLim = std::min(firstCmpLineStart + 2500, loop.size());
+          while (pos < scanLim) {
+            size_t le = loop.find('\n', pos);
+            if (le == std::string::npos) break;
+            std::string cl = loop.substr(pos, le - pos);
+            if (cl.find("v_cndmask_b32_e64") != std::string::npos) {
+              cndCount++;
+              lastCndEnd = le + 1;
+            } else if (cl.find("v_cmp_lt_i32") == std::string::npos &&
+                       cl.find("v_cmp_ge_i32") == std::string::npos &&
+                       !cl.empty() && cl.find_first_not_of(" \t") != std::string::npos) {
+              if (cl.find("buffer_load") != std::string::npos ||
+                  cl.find("ds_read") != std::string::npos ||
+                  cl.find("s_mov") != std::string::npos ||
+                  cl.find("s_waitcnt") != std::string::npos) {
+                sideEffectLines.push_back(cl);
+              }
+            }
+            if (cndCount > 0 && cl.find("v_cndmask") == std::string::npos &&
+                cl.find("v_cmp_lt") == std::string::npos &&
+                cl.find("v_cmp_ge") == std::string::npos &&
+                cl.find("buffer_load") == std::string::npos &&
+                cl.find("ds_read") == std::string::npos &&
+                cl.find("s_mov") == std::string::npos &&
+                cl.find("s_waitcnt") == std::string::npos &&
+                !cl.empty() && cl.find_first_not_of(" \t") != std::string::npos) {
+              break;
+            }
+            pos = le + 1;
+          }
+
+          if (cndCount < 14 || lastCndEnd == 0) {
+            mSearchPos = firstCmpLineEnd + 1; continue;
+          }
+
+          std::string fastLbl = ".Lfm_" + label.substr(1) + "_" +
+                                std::to_string(maskBranchesAdded);
+          std::string mergeLbl = ".Lmm_" + label.substr(1) + "_" +
+                                 std::to_string(maskBranchesAdded);
+
+          std::string checkCode;
+          checkCode += "\tv_cmp_ge_i32_e64 s[0:1], " +
+                       std::to_string(maxThreshold) + ", " +
+                       maskDeltaReg + "\n";
+          checkCode += "\ts_and_b64 s[0:1], s[0:1], exec\n";
+          checkCode += "\ts_cbranch_scc0 " + fastLbl + "\n";
+
+          loop.insert(firstCmpLineStart, checkCode);
+          size_t checkLen = checkCode.size();
+          lastCndEnd += checkLen;
+
+          std::string fastCode;
+          fastCode += "\ts_branch " + mergeLbl + "\n";
+          fastCode += fastLbl + ":\n";
+          for (const auto &sl : sideEffectLines)
+            fastCode += sl + "\n";
+          fastCode += mergeLbl + ":\n";
+          loop.insert(lastCndEnd, fastCode);
+
+          llvm::errs() << "[postProcessISA] Added mask skip (fallback) in " << label
+                       << " body " << maskBranchesAdded
+                       << " (cmp=" << cmpCount
+                       << ", cnd=" << cndCount
+                       << ", sideEffects=" << sideEffectLines.size()
+                       << ", maxTh=" << maxThreshold
+                       << ", delta=" << maskDeltaReg << ")\n";
+
+          maskBranchesAdded++;
+          mSearchPos = lastCndEnd + fastCode.size();
+          continue;
         }
 
         // Verify this is a Body-A block: v_max3 should appear within 600 chars
@@ -1488,11 +2638,11 @@ static std::string postProcessISA(const std::string &isa) {
       }
 
       // --- Pass 10b: Body B mask skip (v_cmp block only, set SGPRs to exec) ---
-      // Body B's v_cmp starts with v_cmp_lt_i32_e32 vcc, and is contiguous,
-      // but v_cndmask is interleaved with MFMA. We skip just the v_cmp block
-      // and set all predicate SGPRs to exec so v_cndmask becomes a no-op.
+      // DISABLED: Body B v_cmp block often has buffer_load interleaved.
+      // Duplicating them in the fast path causes memory faults in some loops.
+      // Body B savings are small (~64 cycles of SALU v_cmp), not worth the risk.
       mSearchPos = 0;
-      while (true) {
+      while (false) {
         std::string bodyBMarker = "v_cmp_lt_i32_e32 vcc, ";
         size_t vcmpPos = loop.find(bodyBMarker, mSearchPos);
         if (vcmpPos == std::string::npos) break;
@@ -1518,10 +2668,11 @@ static std::string postProcessISA(const std::string &isa) {
           mSearchPos = vcmpLineEnd + 1; continue;
         }
 
-        // Count v_cmp_lt_i32 in this contiguous block
+        // Count v_cmp_lt_i32 in this block (tolerates interleaved loads/s_mov)
         int bCmpCount = 0;
         size_t bLastCmpEnd = vcmpLineEnd + 1;
-        std::vector<std::string> sgprPairs; // SGPR pairs used (e.g., "s[0:1]")
+        std::vector<std::string> sgprPairs;
+        std::vector<std::string> bSideEffects;
         bool usesVcc = false;
         size_t bScanLim = std::min(vcmpLineStart + 1200, loop.size());
         size_t bPos = vcmpLineStart;
@@ -1535,7 +2686,6 @@ static std::string postProcessISA(const std::string &isa) {
             bLastCmpEnd = ble + 1;
             if (bcl.find("vcc") != std::string::npos)
               usesVcc = true;
-            // Extract SGPR pair: s[N:N+1]
             size_t sPos = bcl.find("s[");
             if (sPos != std::string::npos) {
               size_t sEnd = bcl.find(']', sPos);
@@ -1548,7 +2698,16 @@ static std::string postProcessISA(const std::string &isa) {
               }
             }
           } else if (bCmpCount > 0) {
-            break; // Past the contiguous v_cmp block
+            if (bcl.find("buffer_load") != std::string::npos ||
+                bcl.find("ds_read") != std::string::npos ||
+                bcl.find("s_mov") != std::string::npos ||
+                bcl.find("s_waitcnt") != std::string::npos) {
+              bSideEffects.push_back(bcl);
+              bLastCmpEnd = ble + 1;
+              bPos = ble + 1;
+              continue;
+            }
+            break;
           }
           bPos = ble + 1;
         }
@@ -1570,10 +2729,12 @@ static std::string postProcessISA(const std::string &isa) {
         loop.insert(vcmpLineStart, bCheck);
         bLastCmpEnd += bCheck.size();
 
-        // Insert fast path (set all preds to exec) + s_branch after v_cmp block
+        // Insert fast path: duplicate side-effect instructions + set preds to exec
         std::string bFast;
         bFast += "\ts_branch " + bMergeLbl + "\n";
         bFast += bFastLbl + ":\n";
+        for (const auto &se : bSideEffects)
+          bFast += se + "\n";
         if (usesVcc)
           bFast += "\ts_mov_b64 vcc, exec\n";
         for (const auto &sp : sgprPairs)
@@ -1599,7 +2760,53 @@ static std::string postProcessISA(const std::string &isa) {
     // (111T → 110.4T without yield, 107.7T with yield). The 2-body loop
     // structure has different timing than the reference's 5-body loop.
 
+    // --- Pass 12: Add yield NOPs after s_setprio 0 ---
+    // DISABLED: Yield NOPs (s_nop 15 + s_nop 7) after s_setprio 0 caused
+    // regression (111T → 109T). The 2-body loop doesn't benefit from the
+    // reference ASM's yield pattern.
+
     result = before + loop + after;
+  }
+
+  // Update VGPR metadata if restructureGEMM2_V2 allocated higher registers
+  {
+    auto updateVgprMeta = [](std::string &s, const std::string &tag, int newVal) {
+      size_t pos = s.find(tag);
+      while (pos != std::string::npos) {
+        size_t numStart = pos + tag.size();
+        while (numStart < s.size() && s[numStart] == ' ') numStart++;
+        size_t numEnd = numStart;
+        while (numEnd < s.size() && isdigit(s[numEnd])) numEnd++;
+        if (numEnd > numStart) {
+          int cur = atoi(s.c_str() + numStart);
+          if (newVal > cur) {
+            std::string nv = std::to_string(newVal);
+            s.replace(numStart, numEnd - numStart, nv);
+          }
+        }
+        pos = s.find(tag, numStart + 1);
+      }
+    };
+    // The static g_maxNewVgpr is accessible here since we're in the same function
+    // We need to read from the static declared in the loop body above.
+    // Since C++ doesn't allow extern on a local static, just re-search the ISA
+    // for the current vgpr count and conditionally update.
+    // Actually, we can just look for any v[235+] references to determine if update needed.
+    bool needsVgprUpdate = false;
+    int maxV = 0;
+    for (int v = 253; v >= 235; v--) {
+      if (result.find("v[" + std::to_string(v) + ":") != std::string::npos ||
+          result.find("v" + std::to_string(v) + ",") != std::string::npos ||
+          result.find("v" + std::to_string(v) + " ") != std::string::npos) {
+        maxV = v + 1;
+        needsVgprUpdate = true;
+        break;
+      }
+    }
+    if (needsVgprUpdate && maxV > 0) {
+      updateVgprMeta(result, ".amdhsa_next_free_vgpr", maxV);
+      updateVgprMeta(result, ".vgpr_count:", maxV);
+    }
   }
 
   {
@@ -1689,10 +2896,20 @@ std::optional<SmallVector<char, 0>> SerializeGPUModuleBase::moduleToObjectImpl(
   // Debug: dump modified ISA to temp file
   {
     static int dumpIdx = 0;
+    const char *targetName = "unknown";
+    switch (targetOptions.getCompilationTarget()) {
+    case gpu::CompilationTarget::Assembly: targetName = "isa"; break;
+    case gpu::CompilationTarget::Binary: targetName = "bin"; break;
+    case gpu::CompilationTarget::Fatbin: targetName = "fatbin"; break;
+    default: break;
+    }
     std::string path = "/tmp/postprocess_isa_" + std::to_string(dumpIdx++) + ".s";
     std::error_code ec;
     llvm::raw_fd_ostream os(path, ec);
     if (!ec) os << *serializedISA;
+    llvm::errs() << "[moduleToObjectImpl] target=" << targetName
+                 << " dump=" << path
+                 << " size=" << serializedISA->size() << "\n";
   }
 
 #define DEBUG_TYPE "serialize-to-isa"
