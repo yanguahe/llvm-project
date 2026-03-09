@@ -111,6 +111,8 @@ private:
 
   bool sinkBreakersFromMFMAChain(MachineBasicBlock &MBB);
 
+  bool coalescePkFmaDstSrc0(MachineBasicBlock &MBB, const SIInstrInfo &TII);
+
   bool tryRenameDSPermuteDst(MachineBasicBlock &MBB, MachineInstr &Perm,
                              MachineInstr &MFMAToMove,
                              MachineBasicBlock::iterator InsertPt);
@@ -600,6 +602,62 @@ bool SIFixSchedBarrierOrderImpl::sinkBreakersFromMFMAChain(
   return Changed;
 }
 
+bool SIFixSchedBarrierOrderImpl::coalescePkFmaDstSrc0(
+    MachineBasicBlock &MBB, const SIInstrInfo &TII) {
+  bool Changed = false;
+
+  for (auto It = MBB.begin(); It != MBB.end(); ++It) {
+    MachineInstr &MI = *It;
+    if (MI.getOpcode() != AMDGPU::V_PK_FMA_F32)
+      continue;
+
+    Register Dst = MI.getOperand(0).getReg();
+    int Src0Idx =
+        AMDGPU::getNamedOperandIdx(AMDGPU::V_PK_FMA_F32, AMDGPU::OpName::src0);
+    int Src2Idx =
+        AMDGPU::getNamedOperandIdx(AMDGPU::V_PK_FMA_F32, AMDGPU::OpName::src2);
+    Register Src0 = MI.getOperand(Src0Idx).getReg();
+    Register Src2 = MI.getOperand(Src2Idx).getReg();
+
+    if (Dst == Src0)
+      continue;
+
+    // If dst overlaps with src2, the copies would destroy src2's value.
+    // Use temp registers (VGPR252_VGPR253) to save src2 first.
+    bool DstOverlapsSrc2 =
+        Src2.isPhysical() && TRI->regsOverlap(Dst, Src2);
+    if (DstOverlapsSrc2) {
+      Register TempPair = AMDGPU::VGPR252_VGPR253;
+      Register TempLo = AMDGPU::VGPR252;
+      Register TempHi = AMDGPU::VGPR253;
+      Register Src2Lo = TRI->getSubReg(Src2, AMDGPU::sub0);
+      Register Src2Hi = TRI->getSubReg(Src2, AMDGPU::sub1);
+
+      BuildMI(MBB, It, MI.getDebugLoc(), TII.get(AMDGPU::V_MOV_B32_e32),
+              TempLo)
+          .addReg(Src2Lo);
+      BuildMI(MBB, It, MI.getDebugLoc(), TII.get(AMDGPU::V_MOV_B32_e32),
+              TempHi)
+          .addReg(Src2Hi);
+      MI.getOperand(Src2Idx).setReg(TempPair);
+    }
+
+    Register DstLo = TRI->getSubReg(Dst, AMDGPU::sub0);
+    Register DstHi = TRI->getSubReg(Dst, AMDGPU::sub1);
+    Register Src0Lo = TRI->getSubReg(Src0, AMDGPU::sub0);
+    Register Src0Hi = TRI->getSubReg(Src0, AMDGPU::sub1);
+
+    BuildMI(MBB, It, MI.getDebugLoc(), TII.get(AMDGPU::V_MOV_B32_e32), DstLo)
+        .addReg(Src0Lo);
+    BuildMI(MBB, It, MI.getDebugLoc(), TII.get(AMDGPU::V_MOV_B32_e32), DstHi)
+        .addReg(Src0Hi);
+    MI.getOperand(Src0Idx).setReg(Dst);
+    Changed = true;
+  }
+
+  return Changed;
+}
+
 bool SIFixSchedBarrierOrderImpl::run(MachineFunction &MF) {
   const GCNSubtarget &ST = MF.getSubtarget<GCNSubtarget>();
   const SIInstrInfo *TII = ST.getInstrInfo();
@@ -610,6 +668,7 @@ bool SIFixSchedBarrierOrderImpl::run(MachineFunction &MF) {
     Changed |= processBlock(MBB, *TII);
     Changed |= hoistMFMAOverDSPermute(MBB);
     Changed |= sinkBreakersFromMFMAChain(MBB);
+    Changed |= coalescePkFmaDstSrc0(MBB, *TII);
   }
 
   return Changed;
