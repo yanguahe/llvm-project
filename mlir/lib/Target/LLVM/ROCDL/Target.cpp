@@ -3743,6 +3743,122 @@ static std::string postProcessISA(const std::string &isa) {
     }
   }
 
+  // --- Pass 15d: Collapse the mid-tail V-staging barrier when the second
+  // permute pair reuses the same VMEM sources as the first pair.
+  // Current hot-path shape in the tail:
+  //   s_waitcnt vmcnt(6)
+  //   v_perm_b32 A0, srcX, srcY, s80/s81
+  //   s_waitcnt vmcnt(4)
+  //   v_perm_b32 A1, srcP, srcQ, s80/s81
+  //   ds_write_b64 ..., A0/A1
+  //   s_barrier
+  //   s_waitcnt vmcnt(0)
+  //   v_perm_b32 B0, srcX, srcY, s81/s80
+  //   v_perm_b32 B1, srcP, srcQ, s81/s80
+  //   ds_write_b64 ..., B0/B1
+  //   s_waitcnt lgkmcnt(0)
+  //   s_barrier
+  // The second permute pair only changes the selector SGPR and reuses the same
+  // VMEM source VGPRs, so it is already safe once vmcnt(4) has been reached.
+  // Move that second pair above the mid-tail barrier and keep the final barrier
+  // as the only LDS-visibility sync point.
+  {
+    auto trim = [](const std::string &line) -> std::string {
+      size_t start = 0;
+      while (start < line.size() && (line[start] == ' ' || line[start] == '\t'))
+        start++;
+      size_t end = line.size();
+      while (end > start && (line[end - 1] == ' ' || line[end - 1] == '\t'))
+        end--;
+      return line.substr(start, end - start);
+    };
+
+    auto splitComma = [&](const std::string &line) {
+      std::vector<std::string> parts;
+      std::string cur;
+      for (char c : trim(line)) {
+        if (c == ',') {
+          parts.push_back(cur);
+          cur.clear();
+        } else {
+          cur.push_back(c);
+        }
+      }
+      parts.push_back(cur);
+      for (auto &p : parts) {
+        size_t s = 0;
+        while (s < p.size() && (p[s] == ' ' || p[s] == '\t'))
+          s++;
+        size_t e = p.size();
+        while (e > s && (p[e - 1] == ' ' || p[e - 1] == '\t'))
+          e--;
+        p = p.substr(s, e - s);
+      }
+      return parts;
+    };
+
+    auto samePermSources = [&](const std::string &a, const std::string &b) {
+      auto pa = splitComma(a);
+      auto pb = splitComma(b);
+      if (pa.size() != 4 || pb.size() != 4)
+        return false;
+      if (pa[0].find("v_perm_b32") != 0 || pb[0].find("v_perm_b32") != 0)
+        return false;
+      return pa[1] == pb[1] && pa[2] == pb[2];
+    };
+
+    std::vector<std::string> allLines;
+    {
+      std::istringstream iss(result);
+      std::string line;
+      while (std::getline(iss, line))
+        allLines.push_back(line);
+    }
+
+    bool modified = false;
+    for (size_t i = 0; i + 11 < allLines.size(); i++) {
+      if (trim(allLines[i]) != "s_waitcnt vmcnt(6)")
+        continue;
+      if (trim(allLines[i + 1]).find("v_perm_b32") != 0 ||
+          trim(allLines[i + 2]) != "s_waitcnt vmcnt(4)" ||
+          trim(allLines[i + 3]).find("v_perm_b32") != 0 ||
+          trim(allLines[i + 4]).find("ds_write_b64") != 0 ||
+          trim(allLines[i + 5]) != "s_barrier" ||
+          trim(allLines[i + 6]) != "s_waitcnt vmcnt(0)" ||
+          trim(allLines[i + 7]).find("v_perm_b32") != 0 ||
+          trim(allLines[i + 8]).find("v_perm_b32") != 0 ||
+          trim(allLines[i + 9]).find("ds_write_b64") != 0 ||
+          trim(allLines[i + 10]) != "s_waitcnt lgkmcnt(0)" ||
+          trim(allLines[i + 11]) != "s_barrier")
+        continue;
+      if (!samePermSources(allLines[i + 1], allLines[i + 7]) ||
+          !samePermSources(allLines[i + 3], allLines[i + 8]))
+        continue;
+
+      std::vector<std::string> repl = {
+          allLines[i],     allLines[i + 1], allLines[i + 2],  allLines[i + 3],
+          allLines[i + 4], allLines[i + 7], allLines[i + 8],  allLines[i + 9],
+          allLines[i + 6], allLines[i + 10], allLines[i + 11],
+      };
+      allLines.erase(allLines.begin() + i, allLines.begin() + i + 12);
+      allLines.insert(allLines.begin() + i, repl.begin(), repl.end());
+
+      llvm::errs() << "[postProcessISA] Pass 15d: Removed mid-tail barrier in "
+                   << "V staging at line " << (i + 1) << "\n";
+      modified = true;
+      i += repl.size() - 1;
+    }
+
+    if (modified) {
+      result.clear();
+      for (size_t j = 0; j < allLines.size(); j++) {
+        result += allLines[j];
+        if (j + 1 < allLines.size())
+          result += "\n";
+      }
+    }
+  }
+
   // --- Pass 16: GEMM2 V-read defragmentation ---
   // DISABLED: Pre-loading all 16 V reads causes regression (114.7T → 109.9T).
   // Root cause: causal mask code between first and second MFMA still fragments
