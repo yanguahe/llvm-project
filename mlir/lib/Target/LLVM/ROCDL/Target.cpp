@@ -3414,23 +3414,42 @@ static std::string postProcessISA(const std::string &isa) {
     }
   }
 
-  // --- Pass 15: Interleave exp2 with K reads to reduce LDS queue contention ---
-  // Finds blocks of exactly 16 consecutive v_exp_f32 followed by 8 consecutive
-  // ds_read_b128, then reorders to: 1 K_read + 2 exp repeated 8 times.
-  // K reads first in each group gives ~8 cycles more lead time vs 2 exp + 1 K.
-  // This spaces consecutive ds_read_b128 by ~12 cycles instead of 4 cycles.
+  // --- Pass 15: Interleave loop-top exp burst with K reads ---
+  // Handles two kernel shapes:
+  //   (A) 16x v_exp_f32 followed by 8x ds_read_b128
+  //   (B) 8x ds_read_b128 followed by an optional s_setprio 1 block,
+  //       a short prefix (for example, v_mul_f32), then 16x v_exp_f32
+  // Reorder both forms to: 1 K_read + 2 exp repeated 8 times.
+  // This spaces consecutive ds_read_b128 by ~12 cycles instead of issuing
+  // all 8 reads back-to-back at the loop top.
   {
-    auto isExpLine = [](const std::string &line) -> bool {
-      auto trimmed = line;
-      while (!trimmed.empty() && (trimmed[0] == ' ' || trimmed[0] == '\t'))
-        trimmed.erase(0, 1);
-      return trimmed.find("v_exp_f32") == 0;
+    auto trim = [](const std::string &line) -> std::string {
+      size_t start = 0;
+      while (start < line.size() && (line[start] == ' ' || line[start] == '\t'))
+        start++;
+      size_t end = line.size();
+      while (end > start && (line[end - 1] == ' ' || line[end - 1] == '\t'))
+        end--;
+      return line.substr(start, end - start);
     };
-    auto isDsReadB128Line = [](const std::string &line) -> bool {
-      auto trimmed = line;
-      while (!trimmed.empty() && (trimmed[0] == ' ' || trimmed[0] == '\t'))
-        trimmed.erase(0, 1);
-      return trimmed.find("ds_read_b128") == 0;
+    auto isExpLine = [&](const std::string &line) -> bool {
+      return trim(line).find("v_exp_f32") == 0;
+    };
+    auto isDsReadB128Line = [&](const std::string &line) -> bool {
+      return trim(line).find("ds_read_b128") == 0;
+    };
+    auto isSetprio1Line = [&](const std::string &line) -> bool {
+      return trim(line) == "s_setprio 1";
+    };
+    auto isAsmStartLine = [&](const std::string &line) -> bool {
+      return trim(line) == ";;#ASMSTART";
+    };
+    auto isAsmEndLine = [&](const std::string &line) -> bool {
+      return trim(line) == ";;#ASMEND";
+    };
+    auto isLabelLine = [&](const std::string &line) -> bool {
+      auto t = trim(line);
+      return !t.empty() && t.back() == ':';
     };
 
     std::vector<std::string> allLines;
@@ -3443,36 +3462,139 @@ static std::string postProcessISA(const std::string &isa) {
 
     bool modified = false;
     for (size_t i = 0; i + 23 < allLines.size(); ) {
-      bool hasExp16 = true;
-      for (size_t e = 0; e < 16; e++) {
-        if (!isExpLine(allLines[i + e])) { hasExp16 = false; break; }
+      size_t advance = 0;
+      auto rewriteExpThenRead = [&](size_t start) -> bool {
+        bool hasExp16 = true;
+        for (size_t e = 0; e < 16; e++) {
+          if (!isExpLine(allLines[start + e])) {
+            hasExp16 = false;
+            break;
+          }
+        }
+        if (!hasExp16)
+          return false;
+
+        bool hasKRead8 = true;
+        for (size_t k = 0; k < 8; k++) {
+          if (!isDsReadB128Line(allLines[start + 16 + k])) {
+            hasKRead8 = false;
+            break;
+          }
+        }
+        if (!hasKRead8)
+          return false;
+
+        std::vector<std::string> expLines(allLines.begin() + start,
+                                          allLines.begin() + start + 16);
+        std::vector<std::string> kLines(allLines.begin() + start + 16,
+                                        allLines.begin() + start + 24);
+
+        std::vector<std::string> interleaved;
+        for (int g = 0; g < 8; g++) {
+          interleaved.push_back(kLines[g]);
+          interleaved.push_back(expLines[2 * g]);
+          interleaved.push_back(expLines[2 * g + 1]);
+        }
+
+        for (int j = 0; j < 24; j++)
+          allLines[start + j] = interleaved[j];
+
+        llvm::errs() << "[postProcessISA] Pass 15: Interleaved exp-then-read "
+                     << "1K+2exp x8 at line " << (start + 1) << "\n";
+        modified = true;
+        advance = 24;
+        return true;
+      };
+
+      auto rewriteReadThenExp = [&](size_t start) -> bool {
+        bool hasKRead8 = true;
+        for (size_t k = 0; k < 8; k++) {
+          if (!isDsReadB128Line(allLines[start + k])) {
+            hasKRead8 = false;
+            break;
+          }
+        }
+        if (!hasKRead8)
+          return false;
+
+        size_t cursor = start + 8;
+        std::vector<std::string> setprioBlock;
+        if (cursor + 2 < allLines.size() && isAsmStartLine(allLines[cursor]) &&
+            isSetprio1Line(allLines[cursor + 1]) &&
+            isAsmEndLine(allLines[cursor + 2])) {
+          setprioBlock.push_back(allLines[cursor]);
+          setprioBlock.push_back(allLines[cursor + 1]);
+          setprioBlock.push_back(allLines[cursor + 2]);
+          cursor += 3;
+        } else if (cursor < allLines.size() && isSetprio1Line(allLines[cursor])) {
+          setprioBlock.push_back(allLines[cursor]);
+          cursor++;
+        }
+
+        std::vector<std::string> prefixLines;
+        while (cursor < allLines.size() && prefixLines.size() < 4 &&
+               !isExpLine(allLines[cursor])) {
+          auto t = trim(allLines[cursor]);
+          if (t.empty()) {
+            prefixLines.push_back(allLines[cursor]);
+            cursor++;
+            continue;
+          }
+
+          if (isDsReadB128Line(allLines[cursor]) || isSetprio1Line(allLines[cursor]) ||
+              isAsmStartLine(allLines[cursor]) || isAsmEndLine(allLines[cursor]) ||
+              isLabelLine(allLines[cursor]))
+            return false;
+
+          prefixLines.push_back(allLines[cursor]);
+          cursor++;
+        }
+
+        if (cursor + 15 >= allLines.size())
+          return false;
+        for (size_t e = 0; e < 16; e++) {
+          if (!isExpLine(allLines[cursor + e]))
+            return false;
+        }
+
+        std::vector<std::string> kLines(allLines.begin() + start,
+                                        allLines.begin() + start + 8);
+        std::vector<std::string> expLines(allLines.begin() + cursor,
+                                          allLines.begin() + cursor + 16);
+        std::vector<std::string> rebuilt;
+        rebuilt.insert(rebuilt.end(), setprioBlock.begin(), setprioBlock.end());
+        rebuilt.insert(rebuilt.end(), prefixLines.begin(), prefixLines.end());
+        for (int g = 0; g < 8; g++) {
+          rebuilt.push_back(kLines[g]);
+          rebuilt.push_back(expLines[2 * g]);
+          rebuilt.push_back(expLines[2 * g + 1]);
+        }
+
+        size_t regionLen = cursor + 16 - start;
+        if (rebuilt.size() != regionLen)
+          return false;
+
+        for (size_t j = 0; j < regionLen; j++)
+          allLines[start + j] = rebuilt[j];
+
+        llvm::errs() << "[postProcessISA] Pass 15: Interleaved read-then-exp "
+                     << "1K+2exp x8 at line " << (start + 1)
+                     << " (prefix=" << prefixLines.size()
+                     << ", setprio=" << setprioBlock.size() << ")\n";
+        modified = true;
+        advance = regionLen;
+        return true;
+      };
+
+      if (rewriteReadThenExp(i)) {
+        i += advance;
+        continue;
       }
-      if (!hasExp16) { i++; continue; }
-
-      bool hasKRead8 = true;
-      for (size_t k = 0; k < 8; k++) {
-        if (!isDsReadB128Line(allLines[i + 16 + k])) { hasKRead8 = false; break; }
+      if (rewriteExpThenRead(i)) {
+        i += advance;
+        continue;
       }
-      if (!hasKRead8) { i += 16; continue; }
-
-      std::vector<std::string> expLines(allLines.begin() + i, allLines.begin() + i + 16);
-      std::vector<std::string> kLines(allLines.begin() + i + 16, allLines.begin() + i + 24);
-
-      // 1 K_read + 2 exp × 8 (K read first in each group for earlier issue)
-      std::vector<std::string> interleaved;
-      for (int g = 0; g < 8; g++) {
-        interleaved.push_back(kLines[g]);
-        interleaved.push_back(expLines[2 * g]);
-        interleaved.push_back(expLines[2 * g + 1]);
-      }
-
-      for (int j = 0; j < 24; j++)
-        allLines[i + j] = interleaved[j];
-
-      llvm::errs() << "[postProcessISA] Pass 15: Interleaved 1K+2exp × 8 at line "
-                    << (i + 1) << "\n";
-      modified = true;
-      i += 24;
+      i++;
     }
 
     if (modified) {
