@@ -3671,6 +3671,78 @@ static std::string postProcessISA(const std::string &isa) {
     }
   }
 
+  // --- Pass 15c: Pull the first Body-B ds_write ahead of the pre-store barrier ---
+  // Hot-path shape after the 112T V-buffer split:
+  //   s_waitcnt vmcnt(6)
+  //   v_perm_b32 v120 ...
+  //   s_waitcnt vmcnt(4)
+  //   v_perm_b32 v121 ...
+  //   s_barrier
+  //   ds_write_b64 v131, v[120:121] offset:26112
+  //   s_waitcnt vmcnt(0)
+  //   v_perm_b32 v122 ...
+  //   v_perm_b32 v123 ...
+  //   ds_write_b64 v131, v[122:123] offset:30272
+  //   s_waitcnt lgkmcnt(0)
+  //   s_barrier
+  // The first ds_write only depends on the first permute pair and writes into the
+  // alternate V LDS buffer. Issue it before the barrier so part of V staging lands
+  // before the costly cross-wave sync without changing the later visibility barrier.
+  {
+    auto trim = [](const std::string &line) -> std::string {
+      size_t start = 0;
+      while (start < line.size() && (line[start] == ' ' || line[start] == '\t'))
+        start++;
+      size_t end = line.size();
+      while (end > start && (line[end - 1] == ' ' || line[end - 1] == '\t'))
+        end--;
+      return line.substr(start, end - start);
+    };
+
+    std::vector<std::string> allLines;
+    {
+      std::istringstream iss(result);
+      std::string line;
+      while (std::getline(iss, line))
+        allLines.push_back(line);
+    }
+
+    bool modified = false;
+    for (size_t i = 0; i + 11 < allLines.size(); i++) {
+      if (trim(allLines[i]) != "s_waitcnt vmcnt(6)")
+        continue;
+      if (trim(allLines[i + 1]).find("v_perm_b32") != 0 ||
+          trim(allLines[i + 2]) != "s_waitcnt vmcnt(4)" ||
+          trim(allLines[i + 3]).find("v_perm_b32") != 0 ||
+          trim(allLines[i + 4]) != "s_barrier" ||
+          trim(allLines[i + 5]).find("ds_write_b64") != 0 ||
+          trim(allLines[i + 6]) != "s_waitcnt vmcnt(0)" ||
+          trim(allLines[i + 7]).find("v_perm_b32") != 0 ||
+          trim(allLines[i + 8]).find("v_perm_b32") != 0 ||
+          trim(allLines[i + 9]).find("ds_write_b64") != 0 ||
+          trim(allLines[i + 10]) != "s_waitcnt lgkmcnt(0)" ||
+          trim(allLines[i + 11]) != "s_barrier")
+        continue;
+
+      std::string firstWrite = allLines[i + 5];
+      allLines.erase(allLines.begin() + i + 5);
+      allLines.insert(allLines.begin() + i + 4, firstWrite);
+      llvm::errs() << "[postProcessISA] Pass 15c: Pulled first ds_write before "
+                   << "pre-store barrier at line " << (i + 1) << "\n";
+      modified = true;
+      i += 11;
+    }
+
+    if (modified) {
+      result.clear();
+      for (size_t j = 0; j < allLines.size(); j++) {
+        result += allLines[j];
+        if (j + 1 < allLines.size())
+          result += "\n";
+      }
+    }
+  }
+
   // --- Pass 16: GEMM2 V-read defragmentation ---
   // DISABLED: Pre-loading all 16 V reads causes regression (114.7T → 109.9T).
   // Root cause: causal mask code between first and second MFMA still fragments
