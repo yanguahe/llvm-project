@@ -2530,7 +2530,9 @@ static std::string postProcessISA(const std::string &isa) {
         int cmpCount = 0;
         int maxThreshold = -100;
         std::vector<std::string> sgprPairs;
-        size_t scanLim = std::min(firstCmpLineStart + 1500, loop.size());
+        // Scattered single-path mask regions can stretch well beyond the old
+        // 1500-char window once compares are interleaved with MFMA/load ops.
+        size_t scanLim = std::min(firstCmpLineStart + 3000, loop.size());
         size_t pos = firstCmpLineStart;
         size_t lastCmpLineEnd = firstCmpLineEnd + 1;
         while (pos < scanLim) {
@@ -2561,8 +2563,7 @@ static std::string postProcessISA(const std::string &isa) {
               if (!found) sgprPairs.push_back(sp);
             }
           }
-          if (cl.find("v_mfma") != std::string::npos ||
-              cl.find("s_barrier") != std::string::npos) break;
+          if (cl.find("s_barrier") != std::string::npos) break;
           pos = le + 1;
         }
 
@@ -2594,6 +2595,127 @@ static std::string postProcessISA(const std::string &isa) {
         }
 
         if (max3Lines.size() < 7) {
+          // Current single-path kernel shape: v_cmp/v_cndmask are scattered across
+          // a region interleaved with MFMAs, LDS reads, and buffer_loads.
+          // Build a fast path by cloning that whole region, removing only the
+          // compares, and pre-setting the mask SGPR pairs to exec so the later
+          // v_cndmask instructions become pass-through on non-boundary blocks.
+          {
+            size_t regionEnd = 0;
+            int regionCmpCount = 0;
+            int regionCndCount = 0;
+            int regionMax3Count = 0;
+            bool seenDsPermute = false;
+            bool unsafeBranchUse = false;
+            std::vector<std::string> regionLines;
+
+            auto isScatteredMaskLine = [&](const std::string &cl) {
+              std::string tl = cl;
+              for (auto &c : tl) c = tolower(c);
+              return (tl.find("v_cmp_") != std::string::npos &&
+                      tl.find(maskDeltaReg) != std::string::npos) ||
+                     tl.find("v_cndmask_b32") != std::string::npos ||
+                     tl.find("v_mfma") != std::string::npos ||
+                     tl.find("ds_read") != std::string::npos ||
+                     tl.find("buffer_load") != std::string::npos ||
+                     tl.find("s_mov_b32 m0") != std::string::npos ||
+                     tl.find("s_waitcnt") != std::string::npos ||
+                     tl.find("v_add_u32") != std::string::npos ||
+                     tl.find("s_setprio") != std::string::npos ||
+                     tl.find("v_max3_f32") != std::string::npos ||
+                     tl.find("ds_permute") != std::string::npos;
+            };
+
+            pos = firstCmpLineStart;
+            scanLim = std::min(firstCmpLineStart + 3500, loop.size());
+            while (pos < scanLim) {
+              size_t le = loop.find('\n', pos);
+              if (le == std::string::npos) break;
+              std::string cl = loop.substr(pos, le - pos);
+              std::string tl = cl;
+              for (auto &c : tl) c = tolower(c);
+
+              bool isCmp = (tl.find("v_cmp_") != std::string::npos &&
+                            tl.find(maskDeltaReg) != std::string::npos);
+              bool isAllowed = isScatteredMaskLine(cl);
+
+              if (tl.find("s_cbranch_vcc") != std::string::npos ||
+                  tl.find("s_cbranch_exec") != std::string::npos ||
+                  tl.find("s_and_saveexec") != std::string::npos ||
+                  tl.find("s_andn2_saveexec") != std::string::npos)
+                unsafeBranchUse = true;
+
+              if (isCmp) regionCmpCount++;
+              if (tl.find("v_cndmask_b32") != std::string::npos) regionCndCount++;
+              if (tl.find("v_max3_f32") != std::string::npos) regionMax3Count++;
+              if (tl.find("ds_permute") != std::string::npos) seenDsPermute = true;
+
+              if (isAllowed) {
+                regionLines.push_back(cl);
+                regionEnd = le + 1;
+                if (seenDsPermute && tl.find("s_waitcnt lgkmcnt(0)") != std::string::npos)
+                  break;
+                pos = le + 1;
+                continue;
+              }
+
+              if (regionCmpCount > 0 &&
+                  !cl.empty() && cl.find_first_not_of(" \t") != std::string::npos)
+                break;
+              pos = le + 1;
+            }
+
+            if (!unsafeBranchUse &&
+                regionCmpCount >= 14 &&
+                regionCndCount >= 12 &&
+                regionMax3Count >= 7 &&
+                seenDsPermute &&
+                regionEnd != 0) {
+              std::string fastLbl = ".Lfm_" + label.substr(1) + "_" +
+                                    std::to_string(maskBranchesAdded);
+              std::string mergeLbl = ".Lmm_" + label.substr(1) + "_" +
+                                     std::to_string(maskBranchesAdded);
+
+              std::string checkCode;
+              checkCode += "\tv_cmp_ge_i32_e64 " + checkSgpr + ", " +
+                           std::to_string(maxThreshold) + ", " +
+                           maskDeltaReg + "\n";
+              checkCode += "\ts_and_b64 " + checkSgpr + ", " + checkSgpr + ", exec\n";
+              checkCode += "\ts_cbranch_scc0 " + fastLbl + "\n";
+
+              loop.insert(firstCmpLineStart, checkCode);
+              size_t checkLen = checkCode.size();
+              regionEnd += checkLen;
+
+              std::string fastCode;
+              fastCode += "\ts_branch " + mergeLbl + "\n";
+              fastCode += fastLbl + ":\n";
+              for (const auto &sp : sgprPairs)
+                fastCode += "\ts_mov_b64 " + sp + ", exec\n";
+              for (const auto &rl : regionLines) {
+                std::string tl = rl;
+                for (auto &c : tl) c = tolower(c);
+                if (tl.find("v_cmp_") != std::string::npos) continue;
+                fastCode += rl + "\n";
+              }
+              fastCode += mergeLbl + ":\n";
+              loop.insert(regionEnd, fastCode);
+
+              llvm::errs() << "[postProcessISA] Added mask skip (scattered-region) in "
+                           << label
+                           << " body " << maskBranchesAdded
+                           << " (cmp=" << regionCmpCount
+                           << ", cnd=" << regionCndCount
+                           << ", max3=" << regionMax3Count
+                           << ", maxTh=" << maxThreshold
+                           << ", delta=" << maskDeltaReg << ")\n";
+
+              maskBranchesAdded++;
+              mSearchPos = regionEnd + fastCode.size();
+              continue;
+            }
+          }
+
           // No interleaved v_max3. Try two sub-cases:
           // (A) Tight block: v_cmp + v_cndmask all together (cndCount >= 14)
           // (B) Scattered: v_cmp block only, v_cndmask after MFMAs
