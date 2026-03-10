@@ -24,7 +24,7 @@ using namespace llvm;
 
 #define DEBUG_TYPE "si-pre-emit-peephole"
 
-static constexpr bool SinkVALUPastMFMA = true;
+static constexpr bool SinkVALUPastMFMA = false;
 
 namespace {
 
