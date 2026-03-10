@@ -3859,6 +3859,62 @@ static std::string postProcessISA(const std::string &isa) {
     }
   }
 
+  // --- Pass 15e: Move the remaining lgkmcnt(0) wait behind the final V-staging
+  // barrier in the collapsed-tail shape. This lets waves rendezvous at the
+  // barrier earlier while preserving the per-wave LDS completion check before
+  // the subsequent ds_read burst.
+  {
+    auto trim = [](const std::string &line) -> std::string {
+      size_t start = 0;
+      while (start < line.size() && (line[start] == ' ' || line[start] == '\t'))
+        start++;
+      size_t end = line.size();
+      while (end > start && (line[end - 1] == ' ' || line[end - 1] == '\t'))
+        end--;
+      return line.substr(start, end - start);
+    };
+
+    std::vector<std::string> allLines;
+    {
+      std::istringstream iss(result);
+      std::string line;
+      while (std::getline(iss, line))
+        allLines.push_back(line);
+    }
+
+    bool modified = false;
+    for (size_t i = 0; i + 10 < allLines.size(); i++) {
+      if (trim(allLines[i]) != "s_waitcnt vmcnt(6)")
+        continue;
+      if (trim(allLines[i + 1]).find("v_perm_b32") != 0 ||
+          trim(allLines[i + 2]) != "s_waitcnt vmcnt(4)" ||
+          trim(allLines[i + 3]).find("v_perm_b32") != 0 ||
+          trim(allLines[i + 4]).find("ds_write_b64") != 0 ||
+          trim(allLines[i + 5]).find("v_perm_b32") != 0 ||
+          trim(allLines[i + 6]).find("v_perm_b32") != 0 ||
+          trim(allLines[i + 7]).find("ds_write_b64") != 0 ||
+          trim(allLines[i + 8]) != "s_waitcnt vmcnt(0)" ||
+          trim(allLines[i + 9]) != "s_waitcnt lgkmcnt(0)" ||
+          trim(allLines[i + 10]) != "s_barrier")
+        continue;
+
+      std::swap(allLines[i + 9], allLines[i + 10]);
+      llvm::errs() << "[postProcessISA] Pass 15e: Moved lgkmcnt wait behind "
+                   << "final V-staging barrier at line " << (i + 1) << "\n";
+      modified = true;
+      i += 10;
+    }
+
+    if (modified) {
+      result.clear();
+      for (size_t j = 0; j < allLines.size(); j++) {
+        result += allLines[j];
+        if (j + 1 < allLines.size())
+          result += "\n";
+      }
+    }
+  }
+
   // --- Pass 16: GEMM2 V-read defragmentation ---
   // DISABLED: Pre-loading all 16 V reads causes regression (114.7T → 109.9T).
   // Root cause: causal mask code between first and second MFMA still fragments
