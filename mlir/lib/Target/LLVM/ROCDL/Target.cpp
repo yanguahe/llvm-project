@@ -3037,6 +3037,217 @@ static std::string postProcessISA(const std::string &isa) {
       }
     }
 
+    // --- Pass 25: Move V reads into GEMM1 MFMA chain ---
+    // GEMM1 MFMAs #1-4 use v[194:201] as SrcA (K data). After each MFMA
+    // issues, those registers are free. V reads (ds_read_b64 to v[194:201])
+    // can be interleaved with later GEMM1 MFMAs. LDS reads use a different
+    // issue port than MFMA, so they're essentially free. And V data arrives
+    // before GEMM2 starts, eliminating lgkmcnt stalls.
+    {
+      unsigned vreadsMoved = 0;
+
+      // Find each GEMM1 chain: 16 consecutive v_mfma followed by s_setprio 0
+      // The V reads are after s_setprio 0: ds_read_b64 × 4
+      size_t sp0search = 0;
+      while (true) {
+        // Find s_setprio 0 (marks GEMM1 end)
+        size_t sp0 = loop.find("s_setprio 0", sp0search);
+        if (sp0 == std::string::npos) break;
+        size_t sp0LineStart = loop.rfind('\n', sp0);
+        sp0LineStart = (sp0LineStart == std::string::npos) ? 0 : sp0LineStart + 1;
+        size_t sp0BlockEnd = loop.find('\n', sp0);
+        if (sp0BlockEnd == std::string::npos) break;
+        sp0BlockEnd++;
+        // Include ASMEND line if present
+        {
+          size_t ae = loop.find(";;#ASMEND", sp0BlockEnd);
+          if (ae != std::string::npos && ae - sp0BlockEnd < 20) {
+            size_t aeEnd = loop.find('\n', ae);
+            if (aeEnd != std::string::npos) sp0BlockEnd = aeEnd + 1;
+          }
+        }
+
+        // Verify s_setprio 0 is preceded by v_mfma (GEMM1 end)
+        size_t asmStartCheck = loop.rfind(";;#ASMSTART", sp0);
+        size_t checkFrom = (asmStartCheck != std::string::npos && sp0 - asmStartCheck < 30)
+            ? asmStartCheck : sp0;
+        size_t lookBack = (checkFrom > 200) ? checkFrom - 200 : 0;
+        std::string beforeSp0 = loop.substr(lookBack, checkFrom - lookBack);
+        if (beforeSp0.rfind("v_mfma") == std::string::npos) {
+          sp0search = sp0BlockEnd;
+          continue;
+        }
+
+        // Collect ds_read_b64 lines after s_setprio 0 (the V reads)
+        std::vector<std::string> vreadLines;
+        std::vector<std::pair<size_t,size_t>> vreadRanges;
+        size_t scanPos = sp0BlockEnd;
+        for (int i = 0; i < 10 && scanPos < loop.size(); i++) {
+          size_t lineEnd = loop.find('\n', scanPos);
+          if (lineEnd == std::string::npos) break;
+          std::string line = loop.substr(scanPos, lineEnd - scanPos);
+          // Trim leading whitespace for check
+          std::string trimmed = line;
+          while (!trimmed.empty() && (trimmed[0] == ' ' || trimmed[0] == '\t'))
+            trimmed.erase(0, 1);
+
+          if (trimmed.find("ds_read_b64") == 0) {
+            vreadLines.push_back(line);
+            vreadRanges.push_back({scanPos, lineEnd + 1});
+            scanPos = lineEnd + 1;
+          } else if (trimmed.empty()) {
+            scanPos = lineEnd + 1;
+          } else {
+            break;
+          }
+        }
+
+        if (vreadLines.size() < 4) {
+          sp0search = sp0BlockEnd;
+          continue;
+        }
+
+        // Only move the first 4 V reads
+        if (vreadLines.size() > 4) {
+          vreadLines.resize(4);
+          vreadRanges.resize(4);
+        }
+
+        // Find the GEMM1 MFMA chain (16 v_mfma before s_setprio 0)
+        // Walk backward from s_setprio 0 to find all MFMAs
+        std::vector<std::pair<size_t,size_t>> mfmaRanges;
+        {
+          size_t mfmaSearchEnd = sp0LineStart;
+          // Also check if there's ASMSTART before s_setprio
+          if (asmStartCheck != std::string::npos && sp0 - asmStartCheck < 30) {
+            size_t asmStartLine = loop.rfind('\n', asmStartCheck);
+            if (asmStartLine != std::string::npos)
+              mfmaSearchEnd = asmStartLine + 1;
+          }
+
+          size_t cur = mfmaSearchEnd;
+          while (mfmaRanges.size() < 16 && cur > 0) {
+            cur--;
+            size_t lineStart = loop.rfind('\n', cur);
+            lineStart = (lineStart == std::string::npos) ? 0 : lineStart + 1;
+            std::string line = loop.substr(lineStart, cur + 1 - lineStart);
+            // Trim
+            std::string trimmed = line;
+            while (!trimmed.empty() && (trimmed[0] == ' ' || trimmed[0] == '\t'))
+              trimmed.erase(0, 1);
+            if (trimmed.find("v_mfma") == 0) {
+              mfmaRanges.push_back({lineStart, cur + 2}); // +2 for newline
+              cur = lineStart;
+              if (lineStart > 0) cur--;
+            } else if (trimmed.empty()) {
+              cur = lineStart;
+              if (lineStart > 0) cur--;
+            } else {
+              break;
+            }
+          }
+        }
+
+        // Reverse to get in order (we collected backward)
+        std::reverse(mfmaRanges.begin(), mfmaRanges.end());
+
+        if (mfmaRanges.size() < 16) {
+          sp0search = sp0BlockEnd;
+          continue;
+        }
+
+        // Strategy: insert V reads after MFMA #4, #6, #8, #10
+        // This spaces them by ~8 cycles (2 MFMAs × 4cy) for LDS port spacing
+        // V reads go after MFMAs [4, 6, 8, 10] (0-indexed: [3, 5, 7, 9])
+        int insertPoints[] = {4, 6, 8, 10}; // 1-indexed MFMA numbers
+
+        // Remove original V reads first (in reverse order)
+        for (int i = (int)vreadRanges.size() - 1; i >= 0; i--) {
+          loop.erase(vreadRanges[i].first,
+                     vreadRanges[i].second - vreadRanges[i].first);
+        }
+
+        // Recalculate MFMA positions after erasure
+        // The erasure was AFTER the MFMAs, so positions are unchanged.
+
+        // Re-find the MFMA chain (positions may have shifted from erasure)
+        mfmaRanges.clear();
+        {
+          // Find s_setprio 0 again
+          size_t sp0New = loop.find("s_setprio 0", sp0search);
+          if (sp0New == std::string::npos) {
+            sp0search = sp0BlockEnd;
+            continue;
+          }
+          size_t sp0NewLineStart = loop.rfind('\n', sp0New);
+          sp0NewLineStart = (sp0NewLineStart == std::string::npos) ? 0 : sp0NewLineStart + 1;
+
+          size_t asmCheck = loop.rfind(";;#ASMSTART", sp0New);
+          size_t mfmaEnd = sp0NewLineStart;
+          if (asmCheck != std::string::npos && sp0New - asmCheck < 30) {
+            size_t asmLine = loop.rfind('\n', asmCheck);
+            if (asmLine != std::string::npos) mfmaEnd = asmLine + 1;
+          }
+
+          size_t cur = mfmaEnd;
+          while (mfmaRanges.size() < 16 && cur > 0) {
+            cur--;
+            size_t lineStart = loop.rfind('\n', cur);
+            lineStart = (lineStart == std::string::npos) ? 0 : lineStart + 1;
+            std::string line = loop.substr(lineStart, cur + 1 - lineStart);
+            std::string trimmed = line;
+            while (!trimmed.empty() && (trimmed[0] == ' ' || trimmed[0] == '\t'))
+              trimmed.erase(0, 1);
+            if (trimmed.find("v_mfma") == 0) {
+              size_t eol = loop.find('\n', lineStart);
+              eol = (eol == std::string::npos) ? loop.size() : eol + 1;
+              mfmaRanges.push_back({lineStart, eol});
+              cur = lineStart;
+              if (lineStart > 0) cur--;
+            } else if (trimmed.empty()) {
+              cur = lineStart;
+              if (lineStart > 0) cur--;
+            } else {
+              break;
+            }
+          }
+          std::reverse(mfmaRanges.begin(), mfmaRanges.end());
+        }
+
+        if (mfmaRanges.size() < 16) {
+          sp0search = sp0BlockEnd;
+          continue;
+        }
+
+        // Insert V reads after specified MFMA positions (insert in reverse to preserve offsets)
+        for (int i = 3; i >= 0; i--) {
+          int afterMfma = insertPoints[i] - 1; // 0-indexed
+          if (afterMfma >= (int)mfmaRanges.size()) continue;
+          size_t insertPos = mfmaRanges[afterMfma].second;
+          std::string ins = vreadLines[i] + "\n";
+          loop.insert(insertPos, ins);
+          // Adjust later MFMA ranges
+          for (int j = afterMfma + 1; j < (int)mfmaRanges.size(); j++) {
+            mfmaRanges[j].first += ins.size();
+            mfmaRanges[j].second += ins.size();
+          }
+        }
+
+        vreadsMoved += 4;
+        llvm::errs() << "[postProcessISA] Pass 25: Moved 4 V reads into"
+                     << " GEMM1 MFMA chain in " << label << "\n";
+
+        // Find new s_setprio 0 position for next iteration
+        size_t newSp0 = loop.find("s_setprio 0", mfmaRanges.back().second);
+        sp0search = (newSp0 != std::string::npos) ? newSp0 + 20 : loop.size();
+      }
+
+      if (vreadsMoved > 0) {
+        llvm::errs() << "[postProcessISA] Pass 25: " << vreadsMoved
+                     << " V reads moved total in " << label << "\n";
+      }
+    }
+
     result = before + loop + after;
   }
 
@@ -3083,7 +3294,8 @@ static std::string postProcessISA(const std::string &isa) {
 
   // --- Pass 15: Interleave exp2 with K reads to reduce LDS queue contention ---
   // Finds blocks of exactly 16 consecutive v_exp_f32 followed by 8 consecutive
-  // ds_read_b128, then reorders to: 2 exp + 1 K_read repeated 8 times.
+  // ds_read_b128, then reorders to: 1 K_read + 2 exp repeated 8 times.
+  // K reads first in each group gives ~8 cycles more lead time vs 2 exp + 1 K.
   // This spaces consecutive ds_read_b128 by ~12 cycles instead of 4 cycles.
   {
     auto isExpLine = [](const std::string &line) -> bool {
@@ -3099,7 +3311,6 @@ static std::string postProcessISA(const std::string &isa) {
       return trimmed.find("ds_read_b128") == 0;
     };
 
-    // Split result into lines
     std::vector<std::string> allLines;
     {
       std::istringstream iss(result);
@@ -3110,37 +3321,33 @@ static std::string postProcessISA(const std::string &isa) {
 
     bool modified = false;
     for (size_t i = 0; i + 23 < allLines.size(); ) {
-      // Check for 16 consecutive v_exp_f32
       bool hasExp16 = true;
       for (size_t e = 0; e < 16; e++) {
         if (!isExpLine(allLines[i + e])) { hasExp16 = false; break; }
       }
       if (!hasExp16) { i++; continue; }
 
-      // Check for 8 consecutive ds_read_b128 right after
       bool hasKRead8 = true;
       for (size_t k = 0; k < 8; k++) {
         if (!isDsReadB128Line(allLines[i + 16 + k])) { hasKRead8 = false; break; }
       }
       if (!hasKRead8) { i += 16; continue; }
 
-      // Extract lines
       std::vector<std::string> expLines(allLines.begin() + i, allLines.begin() + i + 16);
       std::vector<std::string> kLines(allLines.begin() + i + 16, allLines.begin() + i + 24);
 
-      // Build interleaved block: 2 exp + 1 K_read × 8
+      // 1 K_read + 2 exp × 8 (K read first in each group for earlier issue)
       std::vector<std::string> interleaved;
       for (int g = 0; g < 8; g++) {
+        interleaved.push_back(kLines[g]);
         interleaved.push_back(expLines[2 * g]);
         interleaved.push_back(expLines[2 * g + 1]);
-        interleaved.push_back(kLines[g]);
       }
 
-      // Replace in allLines
       for (int j = 0; j < 24; j++)
         allLines[i + j] = interleaved[j];
 
-      llvm::errs() << "[postProcessISA] Interleaved 16 exp2 + 8 K_reads at line "
+      llvm::errs() << "[postProcessISA] Pass 15: Interleaved 1K+2exp × 8 at line "
                     << (i + 1) << "\n";
       modified = true;
       i += 24;
@@ -3154,6 +3361,327 @@ static std::string postProcessISA(const std::string &isa) {
       }
     }
   }
+
+  // --- Pass 16: GEMM2 V-read defragmentation ---
+  // DISABLED: Pre-loading all 16 V reads causes regression (114.7T → 109.9T).
+  // Root cause: causal mask code between first and second MFMA still fragments
+  // the chain, and the lost software-pipelining (interleaved V reads + MFMAs)
+  // outweighs the reduced lgkmcnt stalls. Need to also move causal mask before
+  // GEMM2 to match reference ASM structure for this to work.
+  if (false) {
+    static const int V_OFFSETS[] = {
+      17408, 18432, 19456, 20480, 17536, 18560, 19584, 20608,
+      17664, 18688, 19712, 20736, 17792, 18816, 19840, 20864
+    };
+    static const int NUM_V_OFFSETS = 16;
+
+    std::vector<std::string> allLines;
+    {
+      std::istringstream iss(result);
+      std::string l;
+      while (std::getline(iss, l)) allLines.push_back(l);
+    }
+
+    auto trim = [](const std::string &s) -> std::string {
+      size_t start = 0;
+      while (start < s.size() && (s[start]==' '||s[start]=='\t')) start++;
+      return s.substr(start);
+    };
+
+    auto isVRead = [&](const std::string &l) -> bool {
+      auto t = trim(l);
+      if (t.find("ds_read_b64") != 0) return false;
+      for (int i = 0; i < NUM_V_OFFSETS; i++)
+        if (t.find("offset:" + std::to_string(V_OFFSETS[i])) != std::string::npos)
+          return true;
+      return false;
+    };
+
+    auto parseRegPair = [](const std::string &s, size_t start)
+        -> std::pair<int,int> {
+      auto p = s.find("v[", start);
+      if (p == std::string::npos) return {-1,-1};
+      int lo = atoi(s.c_str() + p + 2);
+      auto c = s.find(':', p + 2);
+      if (c == std::string::npos) return {-1,-1};
+      int hi = atoi(s.c_str() + c + 1);
+      return {lo, hi};
+    };
+
+    auto parseOffset = [](const std::string &s) -> int {
+      auto p = s.find("offset:");
+      if (p == std::string::npos) return -1;
+      return atoi(s.c_str() + p + 7);
+    };
+
+    bool pass16modified = false;
+
+    llvm::errs() << "[Pass 16] allLines.size()=" << allLines.size() << "\n";
+
+    for (size_t scan = 0; scan + 2 < allLines.size(); scan++) {
+      if (trim(allLines[scan]) != "s_setprio 0") continue;
+      llvm::errs() << "[Pass 16] Found s_setprio 0 at line " << scan+1
+                   << ", next=" << trim(allLines[scan+1]).substr(0, 40) << "\n";
+      if (trim(allLines[scan+1]).find(";;#ASMEND") != 0) continue;
+
+      size_t regionStart = scan + 2;
+
+      // Collect V reads in a window after setprio 0
+      struct VR { size_t idx; int dLo, dHi, off; };
+      std::vector<VR> vrs;
+      for (size_t i = regionStart; i < std::min(regionStart+200, allLines.size()); i++) {
+        if (isVRead(allLines[i])) {
+          auto [lo,hi] = parseRegPair(allLines[i], 0);
+          int off = parseOffset(allLines[i]);
+          vrs.push_back({i, lo, hi, off});
+        }
+      }
+      llvm::errs() << "[Pass 16] V reads found: " << vrs.size() << "/" << NUM_V_OFFSETS << "\n";
+      if ((int)vrs.size() != NUM_V_OFFSETS) continue;
+
+      // Skip if V reads are already contiguous (already defragmented)
+      bool alreadyContiguous = true;
+      for (int vi = 1; vi < (int)vrs.size(); vi++) {
+        if (vrs[vi].idx != vrs[vi-1].idx + 1) {
+          alreadyContiguous = false;
+          break;
+        }
+      }
+      if (alreadyContiguous) {
+        llvm::errs() << "[Pass 16] V reads already contiguous, skipping\n";
+        scan = vrs.back().idx;
+        continue;
+      }
+
+      // Pre-compute: find consuming MFMA for each V read
+      // The consuming MFMA is the first MFMA after the V read line
+      // that uses v[dLo:dHi] as SrcA (2nd register argument).
+      struct VRInfo {
+        VR vr;
+        size_t mfmaIdx;       // line index of consuming MFMA
+        int newDLo, newDHi;   // remapped dest (-1 = keep original)
+      };
+      std::vector<VRInfo> vrInfo;
+
+      for (auto &v : vrs) {
+        auto srcA = "v[" + std::to_string(v.dLo) + ":" +
+                    std::to_string(v.dHi) + "]";
+        size_t found = 0;
+        for (size_t j = v.idx + 1; j < std::min(v.idx + 300, allLines.size()); j++) {
+          auto t = trim(allLines[j]);
+          if (t.find("v_mfma_f32_32x32x8_bf16") != 0) continue;
+          // Check SrcA: 2nd v[...] in the line
+          auto p1 = t.find("v[");          // dest
+          if (p1 == std::string::npos) continue;
+          auto p2 = t.find("v[", p1 + 3);  // SrcA
+          if (p2 == std::string::npos) continue;
+          auto [sa_lo, sa_hi] = parseRegPair(t, p2);
+          if (sa_lo == v.dLo && sa_hi == v.dHi) {
+            found = j;
+            break;
+          }
+        }
+        vrInfo.push_back({v, found, -1, -1});
+      }
+
+      // Check all V reads found consuming MFMAs
+      bool allOk = true;
+      for (size_t vi_idx = 0; vi_idx < vrInfo.size(); vi_idx++) {
+        auto &vi = vrInfo[vi_idx];
+        if (vi.mfmaIdx == 0) {
+          llvm::errs() << "[Pass 16] VR#" << vi_idx << " (v["
+                       << vi.vr.dLo << ":" << vi.vr.dHi << "] off="
+                       << vi.vr.off << " line=" << vi.vr.idx+1
+                       << ") NO consuming MFMA found!\n";
+          allOk = false; break;
+        }
+      }
+      if (!allOk) {
+        llvm::errs() << "[Pass 16] SKIP: not all V reads have MFMAs\n";
+        continue;
+      }
+
+      // Build remap table for reused destination registers
+      std::map<std::pair<int,int>, int> destCount;
+      for (auto &vi : vrInfo) destCount[{vi.vr.dLo, vi.vr.dHi}]++;
+
+      // Use VGPRs above the current max (238+) which are guaranteed free.
+      // Must be even-aligned for ds_read_b64 (64-bit aligned VGPR pairs).
+      // The kernel uses v[0:236], limit is 256 for occupancy=1.
+      int nextFree = 238;
+      std::map<std::pair<int,int>, bool> firstSeen;
+      for (auto &vi : vrInfo) {
+        auto key = std::make_pair(vi.vr.dLo, vi.vr.dHi);
+        if (destCount[key] <= 1) continue;
+        if (!firstSeen[key]) {
+          firstSeen[key] = true;
+        } else {
+          vi.newDLo = nextFree;
+          vi.newDHi = nextFree + 1;
+          nextFree += 2;
+        }
+      }
+
+      // Build new V read lines
+      std::vector<std::string> newVReadLines;
+      for (auto &vi : vrInfo) {
+        std::string nl = allLines[vi.vr.idx];
+        if (vi.newDLo >= 0) {
+          auto oldD = "v[" + std::to_string(vi.vr.dLo) + ":" +
+                      std::to_string(vi.vr.dHi) + "]";
+          auto newD = "v[" + std::to_string(vi.newDLo) + ":" +
+                      std::to_string(vi.newDHi) + "]";
+          auto pos = nl.find(oldD);
+          if (pos != std::string::npos) nl.replace(pos, oldD.size(), newD);
+        }
+        newVReadLines.push_back(nl);
+      }
+
+      // Update MFMA SrcA for remapped V reads
+      for (auto &vi : vrInfo) {
+        if (vi.newDLo < 0) continue;
+        auto oldA = "v[" + std::to_string(vi.vr.dLo) + ":" +
+                    std::to_string(vi.vr.dHi) + "]";
+        auto newA = "v[" + std::to_string(vi.newDLo) + ":" +
+                    std::to_string(vi.newDHi) + "]";
+        auto &mline = allLines[vi.mfmaIdx];
+        // Find 2nd v[ (SrcA position)
+        auto p1 = mline.find("v[");
+        if (p1 == std::string::npos) continue;
+        auto p2 = mline.find("v[", p1 + 3);
+        if (p2 == std::string::npos) continue;
+        // Verify it matches
+        if (mline.substr(p2, oldA.size()) == oldA)
+          mline.replace(p2, oldA.size(), newA);
+      }
+
+      // Mark V read lines and V-read-related lgkmcnt for removal
+      std::set<size_t> toRemove;
+      for (auto &vi : vrInfo) toRemove.insert(vi.vr.idx);
+
+      // Find lgkmcnt(3) lines between regionStart and last V read
+      size_t lastVReadLine = vrs.back().idx;
+      for (size_t i = regionStart; i <= lastVReadLine + 3 && i < allLines.size(); i++) {
+        auto t = trim(allLines[i]);
+        if (t.find("s_waitcnt lgkmcnt(3)") == 0) toRemove.insert(i);
+        if (t.find("s_waitcnt lgkmcnt(0)") == 0) {
+          // Only remove if before the first MFMA (V-read-related)
+          if (i < vrInfo[0].mfmaIdx) toRemove.insert(i);
+        }
+      }
+
+      // Find first and second GEMM2 MFMA lines
+      // First MFMA only needs first V read → lgkmcnt(15)
+      // Second MFMA (after causal mask) gets lgkmcnt(0) for full latency hiding
+      size_t firstMfma = allLines.size();
+      size_t secondMfma = allLines.size();
+      for (auto &vi : vrInfo) {
+        if (vi.mfmaIdx < firstMfma) {
+          secondMfma = firstMfma;
+          firstMfma = vi.mfmaIdx;
+        } else if (vi.mfmaIdx < secondMfma && vi.mfmaIdx != firstMfma) {
+          secondMfma = vi.mfmaIdx;
+        }
+      }
+
+      // Rebuild: remove marked lines, insert V reads + progressive lgkmcnt
+      std::vector<std::string> rebuilt;
+      bool vReadsInserted = false;
+      bool lgkm15Inserted = false;
+      bool lgkm0Inserted = false;
+
+      for (size_t i = 0; i < allLines.size(); i++) {
+        if (i == regionStart && !vReadsInserted) {
+          for (auto &vl : newVReadLines) rebuilt.push_back(vl);
+          vReadsInserted = true;
+        }
+        if (toRemove.count(i)) continue;
+
+        if (i == firstMfma && !lgkm15Inserted) {
+          rebuilt.push_back("\ts_waitcnt lgkmcnt(15)");
+          lgkm15Inserted = true;
+        }
+        if (i == secondMfma && !lgkm0Inserted) {
+          rebuilt.push_back("\ts_waitcnt lgkmcnt(0)");
+          lgkm0Inserted = true;
+        }
+        rebuilt.push_back(allLines[i]);
+      }
+      bool lgkmInserted = lgkm15Inserted; // for success check
+
+      if (vReadsInserted && lgkmInserted) {
+        allLines = std::move(rebuilt);
+        pass16modified = true;
+        int remapped = 0;
+        for (auto &vi : vrInfo) if (vi.newDLo >= 0) remapped++;
+        llvm::errs() << "[postProcessISA] Pass 16: defragmented GEMM2 V-reads"
+                     << " (remapped " << remapped << " regs, max v"
+                     << (nextFree - 1) << ") at s_setprio 0 line " << scan+1
+                     << "\n";
+        scan = 0; // restart scan for next body
+      }
+    }
+
+    if (pass16modified) {
+      result.clear();
+      for (size_t j = 0; j < allLines.size(); j++) {
+        result += allLines[j];
+        if (j + 1 < allLines.size()) result += "\n";
+      }
+
+      // Update VGPR metadata for newly allocated registers
+      auto updateVgprMeta16 = [](std::string &s, const std::string &tag, int newVal) {
+        size_t pos = s.find(tag);
+        while (pos != std::string::npos) {
+          size_t numStart = pos + tag.size();
+          while (numStart < s.size() && s[numStart] == ' ') numStart++;
+          size_t numEnd = numStart;
+          while (numEnd < s.size() && isdigit(s[numEnd])) numEnd++;
+          if (numEnd > numStart) {
+            int cur = atoi(s.c_str() + numStart);
+            if (newVal > cur) {
+              std::string nv = std::to_string(newVal);
+              s.replace(numStart, numEnd - numStart, nv);
+              llvm::errs() << "[Pass 16] Updated " << tag << " from "
+                           << cur << " to " << newVal << "\n";
+            }
+          }
+          pos = s.find(tag, numStart + 1);
+        }
+      };
+      // Find max VGPR used by scanning for v[237+] references
+      int maxV16 = 0;
+      for (int v = 255; v >= 237; v--) {
+        std::string vs = "v[" + std::to_string(v) + ":";
+        std::string vs2 = ":" + std::to_string(v) + "]";
+        if (result.find(vs) != std::string::npos ||
+            result.find(vs2) != std::string::npos) {
+          maxV16 = v + 1;
+          break;
+        }
+      }
+      if (maxV16 > 0) {
+        updateVgprMeta16(result, ".amdhsa_next_free_vgpr", maxV16);
+        updateVgprMeta16(result, ".vgpr_count:", maxV16);
+      }
+    }
+  }
+
+  // --- Pass 17: DISABLED ---
+  // Pre-GEMM1 lgkmcnt(0) CANNOT be relaxed: GFX942 lgkmcnt counter uses
+  // strict FIFO ordering. The ds_permute_b32 (issued after 8 K reads) is
+  // the 9th/newest LDS operation. Any lgkmcnt(N>0) leaves it outstanding,
+  // causing the v_add that reads ds_permute result (v67) to get stale data.
+  // Tested lgkmcnt(4) and lgkmcnt(1): both cause MaxErr=2.85e+08.
+  // The GEMM2 lgkmcnt(0) instances are also necessary (gate ds_read data
+  // for the immediately following MFMA). The compiler already optimized
+  // all relaxable lgkmcnt to lgkmcnt(2) or lgkmcnt(3).
+
+  // --- Pass 18: DISABLED ---
+  // Yield window (s_nop 15 + s_nop 7 after s_setprio 0) caused regression
+  // (114.6T → 113.2T). The 48 extra nop cycles per wave outweigh any
+  // barrier stall reduction. Our s_setprio placement (around GEMM1) differs
+  // from reference ASM (around O rescale), so the yield timing doesn't help.
 
   {
     static int dumpIdx = 0;
