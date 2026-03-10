@@ -3606,6 +3606,71 @@ static std::string postProcessISA(const std::string &isa) {
     }
   }
 
+  // --- Pass 15b: Pull the first ds_write ahead of vmcnt(0) in the tail ---
+  // Transition-tail shape in the current best loop:
+  //   s_barrier
+  //   s_waitcnt vmcnt(0)
+  //   v_perm_b32 v122 ...
+  //   v_perm_b32 v123 ...
+  //   ds_write_b64 v132, v[120:121]
+  //   ds_write_b64 v133, v[122:123]
+  //   s_waitcnt lgkmcnt(0)
+  //   s_barrier
+  // The first ds_write only depends on v[120:121], which are already produced
+  // before the preceding barrier. Issue it immediately after that barrier so the
+  // LDS write can overlap with the later vmcnt(0) wait and the second permute pair.
+  {
+    auto trim = [](const std::string &line) -> std::string {
+      size_t start = 0;
+      while (start < line.size() && (line[start] == ' ' || line[start] == '\t'))
+        start++;
+      size_t end = line.size();
+      while (end > start && (line[end - 1] == ' ' || line[end - 1] == '\t'))
+        end--;
+      return line.substr(start, end - start);
+    };
+
+    std::vector<std::string> allLines;
+    {
+      std::istringstream iss(result);
+      std::string line;
+      while (std::getline(iss, line))
+        allLines.push_back(line);
+    }
+
+    bool modified = false;
+    for (size_t i = 1; i + 6 < allLines.size(); i++) {
+      if (trim(allLines[i - 1]) != "s_barrier")
+        continue;
+      if (trim(allLines[i]) != "s_waitcnt vmcnt(0)")
+        continue;
+      if (trim(allLines[i + 1]).find("v_perm_b32") != 0 ||
+          trim(allLines[i + 2]).find("v_perm_b32") != 0 ||
+          trim(allLines[i + 3]).find("ds_write_b64") != 0 ||
+          trim(allLines[i + 4]).find("ds_write_b64") != 0 ||
+          trim(allLines[i + 5]) != "s_waitcnt lgkmcnt(0)" ||
+          trim(allLines[i + 6]) != "s_barrier")
+        continue;
+
+      std::string firstWrite = allLines[i + 3];
+      allLines.erase(allLines.begin() + i + 3);
+      allLines.insert(allLines.begin() + i, firstWrite);
+      llvm::errs() << "[postProcessISA] Pass 15b: Pulled first ds_write before "
+                   << "vmcnt(0) at line " << (i + 1) << "\n";
+      modified = true;
+      i += 6;
+    }
+
+    if (modified) {
+      result.clear();
+      for (size_t j = 0; j < allLines.size(); j++) {
+        result += allLines[j];
+        if (j + 1 < allLines.size())
+          result += "\n";
+      }
+    }
+  }
+
   // --- Pass 16: GEMM2 V-read defragmentation ---
   // DISABLED: Pre-loading all 16 V reads causes regression (114.7T → 109.9T).
   // Root cause: causal mask code between first and second MFMA still fragments
