@@ -4108,6 +4108,148 @@ static std::string postProcessISA(const std::string &isa) {
     }
   }
 
+  // --- Pass 15h: Pull the first pre-18852 LDS write ahead of the second
+  // vmcnt(0) in the common-path handoff.
+  // Current hot-path shape:
+  //   s_waitcnt vmcnt(2)
+  //   v_perm_b32 v120, ...
+  //   v_perm_b32 v144, ...
+  //   s_waitcnt vmcnt(0)
+  //   v_perm_b32 v121, ...
+  //   s_waitcnt vmcnt(0)
+  //   v_perm_b32 v145, ...
+  //   ds_write_b64 ..., v[120:121]
+  //   ds_write_b64 ..., v[144:145]
+  //   s_waitcnt lgkmcnt(0)
+  //   s_barrier
+  // The first ds_write only depends on v120/v121, which are already finalized
+  // after the third permute. Issue it before the second vmcnt(0) so the LDS
+  // write overlaps the remaining VMEM drain instead of landing immediately in
+  // front of the barrier.
+  {
+    auto trim = [](const std::string &line) -> std::string {
+      size_t start = 0;
+      while (start < line.size() && (line[start] == ' ' || line[start] == '\t'))
+        start++;
+      size_t end = line.size();
+      while (end > start && (line[end - 1] == ' ' || line[end - 1] == '\t'))
+        end--;
+      return line.substr(start, end - start);
+    };
+
+    auto startsWith = [&](const std::string &line, const char *prefix) -> bool {
+      return trim(line).find(prefix) == 0;
+    };
+
+    std::vector<std::string> allLines;
+    {
+      std::istringstream iss(result);
+      std::string line;
+      while (std::getline(iss, line))
+        allLines.push_back(line);
+    }
+
+    bool modified = false;
+    for (size_t i = 0; i + 10 < allLines.size(); i++) {
+      if (trim(allLines[i]) != "s_waitcnt vmcnt(2)")
+        continue;
+      if (!startsWith(allLines[i + 1], "v_perm_b32") ||
+          !startsWith(allLines[i + 2], "v_perm_b32") ||
+          trim(allLines[i + 3]) != "s_waitcnt vmcnt(0)" ||
+          !startsWith(allLines[i + 4], "v_perm_b32") ||
+          trim(allLines[i + 5]) != "s_waitcnt vmcnt(0)" ||
+          !startsWith(allLines[i + 6], "v_perm_b32") ||
+          trim(allLines[i + 7]).find("ds_write_b64 v131, v[120:121] offset:17408") != 0 ||
+          trim(allLines[i + 8]).find("ds_write_b64 v131, v[144:145] offset:21568") != 0 ||
+          trim(allLines[i + 9]) != "s_waitcnt lgkmcnt(0)" ||
+          trim(allLines[i + 10]) != "s_barrier")
+        continue;
+
+      std::string firstWrite = allLines[i + 7];
+      allLines.erase(allLines.begin() + i + 7);
+      allLines.insert(allLines.begin() + i + 5, firstWrite);
+      llvm::errs() << "[postProcessISA] Pass 15h: Pulled first common-path "
+                   << "pre-18852 ds_write ahead of trailing vmcnt(0) at line "
+                   << (i + 1) << "\n";
+      modified = true;
+      i += 10;
+    }
+
+    if (modified) {
+      result.clear();
+      for (size_t j = 0; j < allLines.size(); j++) {
+        result += allLines[j];
+        if (j + 1 < allLines.size())
+          result += "\n";
+      }
+    }
+  }
+
+  // --- Pass 15i: Move the pre-18852 lgkmcnt(0) wait behind the common-path
+  // handoff barrier so waves can rendezvous earlier.
+  // Current hot-path shape after Pass 15h:
+  //   ... ds_write_b64 v[120:121]
+  //   s_waitcnt vmcnt(0)
+  //   v_perm_b32 v145, ...
+  //   ds_write_b64 v[144:145]
+  //   s_waitcnt lgkmcnt(0)
+  //   s_barrier
+  //   ds_read_b128 v[142:145], v132
+  // The barrier is the cross-wave rendezvous point, while the lgkmcnt wait only
+  // guards the following per-wave ds_read burst. Swap them so waves reach the
+  // barrier sooner, then pay the remaining LDS completion cost after barrier.
+  {
+    auto trim = [](const std::string &line) -> std::string {
+      size_t start = 0;
+      while (start < line.size() && (line[start] == ' ' || line[start] == '\t'))
+        start++;
+      size_t end = line.size();
+      while (end > start && (line[end - 1] == ' ' || line[end - 1] == '\t'))
+        end--;
+      return line.substr(start, end - start);
+    };
+
+    auto startsWith = [&](const std::string &line, const char *prefix) -> bool {
+      return trim(line).find(prefix) == 0;
+    };
+
+    std::vector<std::string> allLines;
+    {
+      std::istringstream iss(result);
+      std::string line;
+      while (std::getline(iss, line))
+        allLines.push_back(line);
+    }
+
+    bool modified = false;
+    for (size_t i = 0; i + 6 < allLines.size(); i++) {
+      if (trim(allLines[i]).find("ds_write_b64 v131, v[120:121] offset:17408") != 0 ||
+          trim(allLines[i + 1]) != "s_waitcnt vmcnt(0)" ||
+          !startsWith(allLines[i + 2], "v_perm_b32") ||
+          trim(allLines[i + 3]).find("ds_write_b64 v131, v[144:145] offset:21568") != 0 ||
+          trim(allLines[i + 4]) != "s_waitcnt lgkmcnt(0)" ||
+          trim(allLines[i + 5]) != "s_barrier" ||
+          !startsWith(allLines[i + 6], "ds_read_b128 v[142:145], v132"))
+        continue;
+
+      std::swap(allLines[i + 4], allLines[i + 5]);
+      llvm::errs() << "[postProcessISA] Pass 15i: Moved common-path pre-18852 "
+                   << "lgkmcnt wait behind barrier at line " << (i + 1)
+                   << "\n";
+      modified = true;
+      i += 6;
+    }
+
+    if (modified) {
+      result.clear();
+      for (size_t j = 0; j < allLines.size(); j++) {
+        result += allLines[j];
+        if (j + 1 < allLines.size())
+          result += "\n";
+      }
+    }
+  }
+
   // --- Pass 16: GEMM2 V-read defragmentation ---
   // DISABLED: Pre-loading all 16 V reads causes regression (114.7T → 109.9T).
   // Root cause: causal mask code between first and second MFMA still fragments
