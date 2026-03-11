@@ -4389,6 +4389,73 @@ static std::string postProcessISA(const std::string &isa) {
     }
   }
 
+  // --- Pass 15l: Start the common-path V buffer-load quartet earlier.
+  // Current hot-path shape in the post-18852 tail:
+  //   v_mfma_f32_32x32x8_bf16 v[48:63], v[144:145], v[180:181], v[48:63]
+  //   ds_read_b64 v[142:143], ...
+  //   ds_read_b64 v[144:145], ...
+  //   ds_read_b64 v[162:163], ...
+  //   buffer_load_dword v164, v137, s[48:51], s55 offen
+  //   buffer_load_dword v165, v138, s[48:51], s55 offen
+  //   buffer_load_dword v166, v139, s[48:51], s55 offen
+  //   buffer_load_dword v167, v140, s[48:51], s55 offen
+  // Hoist the common-path VMEM quartet right after the first MFMA so it can
+  // overlap a little earlier with the following MFMA/VALU work, while keeping
+  // the branch-local LDS-backed loads in place.
+  {
+    auto trim = [](const std::string &line) -> std::string {
+      size_t start = 0;
+      while (start < line.size() && (line[start] == ' ' || line[start] == '\t'))
+        start++;
+      size_t end = line.size();
+      while (end > start && (line[end - 1] == ' ' || line[end - 1] == '\t'))
+        end--;
+      return line.substr(start, end - start);
+    };
+
+    std::vector<std::string> allLines;
+    {
+      std::istringstream iss(result);
+      std::string line;
+      while (std::getline(iss, line))
+        allLines.push_back(line);
+    }
+
+    bool modified = false;
+    for (size_t i = 0; i + 7 < allLines.size(); i++) {
+      if (trim(allLines[i]).find(
+              "v_mfma_f32_32x32x8_bf16 v[48:63], v[144:145], v[180:181], "
+              "v[48:63]") != 0 ||
+          trim(allLines[i + 1]).find("ds_read_b64 v[142:143], v128 offset:18816") != 0 ||
+          trim(allLines[i + 2]).find("ds_read_b64 v[144:145], v128 offset:19840") != 0 ||
+          trim(allLines[i + 3]).find("ds_read_b64 v[162:163], v128 offset:20864") != 0 ||
+          trim(allLines[i + 4]).find("buffer_load_dword v164, v137, s[48:51], s55 offen") != 0 ||
+          trim(allLines[i + 5]).find("buffer_load_dword v165, v138, s[48:51], s55 offen") != 0 ||
+          trim(allLines[i + 6]).find("buffer_load_dword v166, v139, s[48:51], s55 offen") != 0 ||
+          trim(allLines[i + 7]).find("buffer_load_dword v167, v140, s[48:51], s55 offen") != 0)
+        continue;
+
+      std::vector<std::string> moved = {allLines[i + 4], allLines[i + 5],
+                                        allLines[i + 6], allLines[i + 7]};
+      allLines.erase(allLines.begin() + i + 4, allLines.begin() + i + 8);
+      allLines.insert(allLines.begin() + i + 1, moved.begin(), moved.end());
+      llvm::errs() << "[postProcessISA] Pass 15l: Hoisted common-path V "
+                   << "buffer-load quartet after first post-18852 MFMA at line "
+                   << (i + 1) << "\n";
+      modified = true;
+      i += 7;
+    }
+
+    if (modified) {
+      result.clear();
+      for (size_t j = 0; j < allLines.size(); j++) {
+        result += allLines[j];
+        if (j + 1 < allLines.size())
+          result += "\n";
+      }
+    }
+  }
+
   // --- Pass 16: GEMM2 V-read defragmentation ---
   // DISABLED: Pre-loading all 16 V reads causes regression (114.7T → 109.9T).
   // Root cause: causal mask code between first and second MFMA still fragments
