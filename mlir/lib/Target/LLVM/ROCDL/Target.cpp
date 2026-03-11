@@ -4250,6 +4250,75 @@ static std::string postProcessISA(const std::string &isa) {
     }
   }
 
+  // --- Pass 15j: Delay the prefixed pre-exp lgkmcnt(0) until just before the
+  // first ds_read burst.
+  // Current hot-path shape:
+  //   ds_write_b64 ..., v[196:197]
+  //   s_waitcnt lgkmcnt(0)
+  //   s_barrier
+  //   ;;#ASMSTART
+  //   s_setprio 1
+  //   ;;#ASMEND
+  //   v_mul_f32_e32 ...
+  //   ds_read_b128 v[196:199], v132
+  // The lgkm wait only guards the upcoming ds_read burst, while the barrier,
+  // setprio handoff, and prefix v_mul are independent. Move the wait down so
+  // those common-path instructions execute before paying the LDS completion cost.
+  {
+    auto trim = [](const std::string &line) -> std::string {
+      size_t start = 0;
+      while (start < line.size() && (line[start] == ' ' || line[start] == '\t'))
+        start++;
+      size_t end = line.size();
+      while (end > start && (line[end - 1] == ' ' || line[end - 1] == '\t'))
+        end--;
+      return line.substr(start, end - start);
+    };
+
+    auto startsWith = [&](const std::string &line, const char *prefix) -> bool {
+      return trim(line).find(prefix) == 0;
+    };
+
+    std::vector<std::string> allLines;
+    {
+      std::istringstream iss(result);
+      std::string line;
+      while (std::getline(iss, line))
+        allLines.push_back(line);
+    }
+
+    bool modified = false;
+    for (size_t i = 0; i + 7 < allLines.size(); i++) {
+      if (trim(allLines[i]).find("ds_write_b64 v131, v[196:197] offset:21568") != 0 ||
+          trim(allLines[i + 1]) != "s_waitcnt lgkmcnt(0)" ||
+          trim(allLines[i + 2]) != "s_barrier" ||
+          trim(allLines[i + 3]) != ";;#ASMSTART" ||
+          trim(allLines[i + 4]) != "s_setprio 1" ||
+          trim(allLines[i + 5]) != ";;#ASMEND" ||
+          !startsWith(allLines[i + 6], "v_mul_f32_e32") ||
+          !startsWith(allLines[i + 7], "ds_read_b128 v[196:199], v132"))
+        continue;
+
+      std::string wait = allLines[i + 1];
+      allLines.erase(allLines.begin() + i + 1);
+      allLines.insert(allLines.begin() + i + 6, wait);
+      llvm::errs() << "[postProcessISA] Pass 15j: Delayed prefixed pre-exp "
+                   << "lgkmcnt wait to just before ds_read at line "
+                   << (i + 1) << "\n";
+      modified = true;
+      i += 7;
+    }
+
+    if (modified) {
+      result.clear();
+      for (size_t j = 0; j < allLines.size(); j++) {
+        result += allLines[j];
+        if (j + 1 < allLines.size())
+          result += "\n";
+      }
+    }
+  }
+
   // --- Pass 16: GEMM2 V-read defragmentation ---
   // DISABLED: Pre-loading all 16 V reads causes regression (114.7T → 109.9T).
   // Root cause: causal mask code between first and second MFMA still fragments
