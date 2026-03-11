@@ -4319,6 +4319,76 @@ static std::string postProcessISA(const std::string &isa) {
     }
   }
 
+  // --- Pass 15k: Fill the post-20936 GEMM2 lgkm wait with common-path SALU.
+  // Current hot-path shape:
+  //   s_and_b64 s[0:1], vcc, exec
+  //   s_waitcnt lgkmcnt(0)
+  //   v_mfma_f32_32x32x8_bf16 v[48:63], v[118:119], v[176:177], v[48:63]
+  //   ds_read_b64 ...
+  //   ds_read_b64 ...
+  //   ds_read_b64 ...
+  //   ds_read_b64 ...
+  //   s_cselect_b32 s0, s52, s35
+  //   s_mov_b32 m0, s43
+  //   s_mul_i32 s0, s63, s0
+  // The SALU trio only prepares the later branch-local buffer_load soffset/m0
+  // state. Pull it in front of the lgkm wait so the wait window does useful
+  // work without perturbing the MFMA/VALU cadence.
+  {
+    auto trim = [](const std::string &line) -> std::string {
+      size_t start = 0;
+      while (start < line.size() && (line[start] == ' ' || line[start] == '\t'))
+        start++;
+      size_t end = line.size();
+      while (end > start && (line[end - 1] == ' ' || line[end - 1] == '\t'))
+        end--;
+      return line.substr(start, end - start);
+    };
+
+    std::vector<std::string> allLines;
+    {
+      std::istringstream iss(result);
+      std::string line;
+      while (std::getline(iss, line))
+        allLines.push_back(line);
+    }
+
+    bool modified = false;
+    for (size_t i = 0; i + 9 < allLines.size(); i++) {
+      if (trim(allLines[i]) != "s_and_b64 s[0:1], vcc, exec" ||
+          trim(allLines[i + 1]) != "s_waitcnt lgkmcnt(0)" ||
+          trim(allLines[i + 2]).find(
+              "v_mfma_f32_32x32x8_bf16 v[48:63], v[118:119], v[176:177], "
+              "v[48:63]") != 0 ||
+          trim(allLines[i + 3]).find("ds_read_b64 v[118:119], v128 offset:26240") != 0 ||
+          trim(allLines[i + 4]).find("ds_read_b64 v[150:151], v128 offset:27264") != 0 ||
+          trim(allLines[i + 5]).find("ds_read_b64 v[152:153], v128 offset:28288") != 0 ||
+          trim(allLines[i + 6]).find("ds_read_b64 v[154:155], v128 offset:29312") != 0 ||
+          trim(allLines[i + 7]) != "s_cselect_b32 s0, s52, s35" ||
+          trim(allLines[i + 8]) != "s_mov_b32 m0, s43" ||
+          trim(allLines[i + 9]) != "s_mul_i32 s0, s63, s0")
+        continue;
+
+      std::vector<std::string> moved = {allLines[i + 7], allLines[i + 8],
+                                        allLines[i + 9]};
+      allLines.erase(allLines.begin() + i + 7, allLines.begin() + i + 10);
+      allLines.insert(allLines.begin() + i + 1, moved.begin(), moved.end());
+      llvm::errs() << "[postProcessISA] Pass 15k: Hoisted common-path SALU "
+                   << "into post-20936 lgkm wait at line " << (i + 1) << "\n";
+      modified = true;
+      i += 9;
+    }
+
+    if (modified) {
+      result.clear();
+      for (size_t j = 0; j < allLines.size(); j++) {
+        result += allLines[j];
+        if (j + 1 < allLines.size())
+          result += "\n";
+      }
+    }
+  }
+
   // --- Pass 16: GEMM2 V-read defragmentation ---
   // DISABLED: Pre-loading all 16 V reads causes regression (114.7T → 109.9T).
   // Root cause: causal mask code between first and second MFMA still fragments
