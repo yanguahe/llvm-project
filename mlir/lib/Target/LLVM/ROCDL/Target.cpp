@@ -2801,6 +2801,7 @@ static std::string postProcessISA(const std::string &isa) {
             // the corresponding exec predicate write at the same position. This
             // preserves scalar-address lifetimes like s0/s4 that are still used by
             // buffer_load instructions before their final compare redefines them.
+            // The companion FlyDSL K-soffset load form depends on that ordering.
             std::vector<std::string> cmpFastLines;
             pos = firstCmpLineStart;
             while (pos < lastCmpLineEnd) {
