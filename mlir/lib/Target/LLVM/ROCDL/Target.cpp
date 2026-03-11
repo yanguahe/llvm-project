@@ -3946,6 +3946,168 @@ static std::string postProcessISA(const std::string &isa) {
     }
   }
 
+  // --- Pass 15f: Pull the first pre-exp LDS write ahead of the final vmcnt(0)
+  // in the prefixed pre-18852 handoff.
+  // Hot-path shape:
+  //   s_waitcnt vmcnt(2)
+  //   v_perm_b32 A0 ...
+  //   s_waitcnt vmcnt(0)
+  //   v_perm_b32 A1 ...
+  //   s_waitcnt vmcnt(0)
+  //   v_perm_b32 B0 ...
+  //   v_perm_b32 B1 ...
+  //   ds_write_b64 ..., A0/A1
+  //   ds_write_b64 ..., B0/B1
+  //   s_waitcnt lgkmcnt(0)
+  //   s_barrier
+  //   ;;#ASMSTART / s_setprio 1 / ;;#ASMEND
+  // The first ds_write only depends on the completed A0/A1 permute pair. Issue
+  // it before the second vmcnt(0) and the later B0/B1 permutes so the LDS write
+  // can overlap the remaining VMEM drain and permute work instead of landing
+  // immediately in front of the barrier.
+  {
+    auto trim = [](const std::string &line) -> std::string {
+      size_t start = 0;
+      while (start < line.size() && (line[start] == ' ' || line[start] == '\t'))
+        start++;
+      size_t end = line.size();
+      while (end > start && (line[end - 1] == ' ' || line[end - 1] == '\t'))
+        end--;
+      return line.substr(start, end - start);
+    };
+
+    std::vector<std::string> allLines;
+    {
+      std::istringstream iss(result);
+      std::string line;
+      while (std::getline(iss, line))
+        allLines.push_back(line);
+    }
+
+    bool modified = false;
+    for (size_t i = 0; i + 13 < allLines.size(); i++) {
+      if (trim(allLines[i]) != "s_waitcnt vmcnt(2)")
+        continue;
+      if (trim(allLines[i + 1]).find("v_perm_b32") != 0 ||
+          trim(allLines[i + 2]) != "s_waitcnt vmcnt(0)" ||
+          trim(allLines[i + 3]).find("v_perm_b32") != 0 ||
+          trim(allLines[i + 4]) != "s_waitcnt vmcnt(0)" ||
+          trim(allLines[i + 5]).find("v_perm_b32") != 0 ||
+          trim(allLines[i + 6]).find("v_perm_b32") != 0 ||
+          trim(allLines[i + 7]).find("ds_write_b64") != 0 ||
+          trim(allLines[i + 8]).find("ds_write_b64") != 0 ||
+          trim(allLines[i + 9]) != "s_waitcnt lgkmcnt(0)" ||
+          trim(allLines[i + 10]) != "s_barrier" ||
+          trim(allLines[i + 11]) != ";;#ASMSTART" ||
+          trim(allLines[i + 12]) != "s_setprio 1" ||
+          trim(allLines[i + 13]) != ";;#ASMEND")
+        continue;
+
+      std::string firstWrite = allLines[i + 7];
+      allLines.erase(allLines.begin() + i + 7);
+      allLines.insert(allLines.begin() + i + 4, firstWrite);
+      llvm::errs() << "[postProcessISA] Pass 15f: Pulled first pre-exp ds_write "
+                   << "before trailing vmcnt(0) at line " << (i + 1) << "\n";
+      modified = true;
+      i += 13;
+    }
+
+    if (modified) {
+      result.clear();
+      for (size_t j = 0; j < allLines.size(); j++) {
+        result += allLines[j];
+        if (j + 1 < allLines.size())
+          result += "\n";
+      }
+    }
+  }
+
+  // --- Pass 15g: Start the first pre-20936 V LDS write inside the trailing
+  // pk_mul chain instead of after the whole chain drains.
+  // Current hot-path shape:
+  //   v_pk_mul x32
+  //   s_waitcnt vmcnt(6)
+  //   v_perm_b32 ...
+  //   s_waitcnt vmcnt(4)
+  //   v_perm_b32 ...
+  //   ds_write_b64 ...
+  //   v_perm_b32 ...
+  //   v_perm_b32 ...
+  //   ds_write_b64 ...
+  //   s_waitcnt vmcnt(0)
+  //   s_barrier
+  // The first permute pair and ds_write only serve the next V staging handoff.
+  // Insert them ahead of the final eight pk_mul ops so the LDS write can
+  // overlap the remaining pk_mul tail.
+  {
+    auto trim = [](const std::string &line) -> std::string {
+      size_t start = 0;
+      while (start < line.size() && (line[start] == ' ' || line[start] == '\t'))
+        start++;
+      size_t end = line.size();
+      while (end > start && (line[end - 1] == ' ' || line[end - 1] == '\t'))
+        end--;
+      return line.substr(start, end - start);
+    };
+
+    auto isPkMul = [&](const std::string &line) -> bool {
+      return trim(line).find("v_pk_mul_f32") == 0;
+    };
+
+    std::vector<std::string> allLines;
+    {
+      std::istringstream iss(result);
+      std::string line;
+      while (std::getline(iss, line))
+        allLines.push_back(line);
+    }
+
+    bool modified = false;
+    for (size_t i = 0; i + 42 < allLines.size(); i++) {
+      bool hasPkMul32 = true;
+      for (size_t j = 0; j < 32; j++) {
+        if (!isPkMul(allLines[i + j])) {
+          hasPkMul32 = false;
+          break;
+        }
+      }
+      if (!hasPkMul32)
+        continue;
+      if (trim(allLines[i + 32]) != "s_waitcnt vmcnt(6)" ||
+          trim(allLines[i + 33]).find("v_perm_b32") != 0 ||
+          trim(allLines[i + 34]) != "s_waitcnt vmcnt(4)" ||
+          trim(allLines[i + 35]).find("v_perm_b32") != 0 ||
+          trim(allLines[i + 36]).find("ds_write_b64") != 0 ||
+          trim(allLines[i + 37]).find("v_perm_b32") != 0 ||
+          trim(allLines[i + 38]).find("v_perm_b32") != 0 ||
+          trim(allLines[i + 39]).find("ds_write_b64") != 0 ||
+          trim(allLines[i + 40]) != "s_waitcnt vmcnt(0)" ||
+          trim(allLines[i + 41]) != "s_barrier")
+        continue;
+
+      std::vector<std::string> moved = {
+          allLines[i + 32], allLines[i + 33], allLines[i + 34],
+          allLines[i + 35], allLines[i + 36],
+      };
+      allLines.erase(allLines.begin() + i + 32, allLines.begin() + i + 37);
+      allLines.insert(allLines.begin() + i + 24, moved.begin(), moved.end());
+      llvm::errs() << "[postProcessISA] Pass 15g: Pulled first pre-barrier "
+                   << "V staging block into pk_mul tail at line " << (i + 1)
+                   << "\n";
+      modified = true;
+      i += 42;
+    }
+
+    if (modified) {
+      result.clear();
+      for (size_t j = 0; j < allLines.size(); j++) {
+        result += allLines[j];
+        if (j + 1 < allLines.size())
+          result += "\n";
+      }
+    }
+  }
+
   // --- Pass 16: GEMM2 V-read defragmentation ---
   // DISABLED: Pre-loading all 16 V reads causes regression (114.7T → 109.9T).
   // Root cause: causal mask code between first and second MFMA still fragments
