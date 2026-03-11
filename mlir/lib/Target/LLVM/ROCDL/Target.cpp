@@ -3562,12 +3562,26 @@ static std::string postProcessISA(const std::string &isa) {
         std::vector<std::string> expLines(allLines.begin() + cursor,
                                           allLines.begin() + cursor + 16);
         std::vector<std::string> rebuilt;
-        rebuilt.insert(rebuilt.end(), setprioBlock.begin(), setprioBlock.end());
-        rebuilt.insert(rebuilt.end(), prefixLines.begin(), prefixLines.end());
-        for (int g = 0; g < 8; g++) {
-          rebuilt.push_back(kLines[g]);
-          rebuilt.push_back(expLines[2 * g]);
-          rebuilt.push_back(expLines[2 * g + 1]);
+        if (!setprioBlock.empty() && prefixLines.empty()) {
+          // Keep the first read-then-exp group under the existing wave-priority
+          // split and only re-raise priority once the burst is already underway.
+          rebuilt.push_back(kLines[0]);
+          rebuilt.push_back(expLines[0]);
+          rebuilt.push_back(expLines[1]);
+          rebuilt.insert(rebuilt.end(), setprioBlock.begin(), setprioBlock.end());
+          for (int g = 1; g < 8; g++) {
+            rebuilt.push_back(kLines[g]);
+            rebuilt.push_back(expLines[2 * g]);
+            rebuilt.push_back(expLines[2 * g + 1]);
+          }
+        } else {
+          rebuilt.insert(rebuilt.end(), setprioBlock.begin(), setprioBlock.end());
+          rebuilt.insert(rebuilt.end(), prefixLines.begin(), prefixLines.end());
+          for (int g = 0; g < 8; g++) {
+            rebuilt.push_back(kLines[g]);
+            rebuilt.push_back(expLines[2 * g]);
+            rebuilt.push_back(expLines[2 * g + 1]);
+          }
         }
 
         size_t regionLen = cursor + 16 - start;
