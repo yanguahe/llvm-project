@@ -80,6 +80,12 @@ private:
     return Opc == AMDGPU::DS_PERMUTE_B32 || Opc == AMDGPU::DS_BPERMUTE_B32;
   }
 
+  static bool isSimpleCrossableInstr(const MachineInstr &MI) {
+    return !MI.isMetaInstruction() && !MI.isTerminator() && !MI.isBranch() &&
+           !MI.isCall() && !MI.isInlineAsm() && !MI.mayLoadOrStore() &&
+           !isSBarrier(MI) && !isDSPermute(MI) && !isMFMA(MI);
+  }
+
   bool regsConflict(const MachineInstr &A, const MachineInstr &B) const {
     for (const MachineOperand &Def : A.operands()) {
       if (!Def.isReg() || !Def.isDef())
@@ -283,9 +289,25 @@ bool SIFixSchedBarrierOrder::hoistMFMAOverDSPermute(MachineBasicBlock &MBB) {
         continue;
       }
       if (!isMFMA(*Next)) {
-        errs() << "SIFixSBO[" << MF->getName() << " BB"
-               << MBB.getNumber() << "]: skip, next=" << Next->getOpcode()
-               << "\n";
+        auto Mid = Next;
+        auto MFMAIt = std::next(Mid);
+        while (MFMAIt != MBB.end() && isNopOrWaitcnt(*MFMAIt))
+          ++MFMAIt;
+        if (MFMAIt == MBB.end() || !isMFMA(*MFMAIt) ||
+            !isSimpleCrossableInstr(*Mid)) {
+          errs() << "SIFixSBO[" << MF->getName() << " BB"
+                 << MBB.getNumber() << "]: skip, next=" << Next->getOpcode()
+                 << "\n";
+          continue;
+        }
+
+        MachineInstr &MFMA = *MFMAIt;
+        if (regsConflict(Perm, MFMA) || regsConflict(*Mid, MFMA))
+          continue;
+
+        auto PermIt = Perm.getIterator();
+        MBB.splice(PermIt, &MBB, MFMA.getIterator());
+        Changed = true;
         continue;
       }
 
