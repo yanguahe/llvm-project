@@ -2797,18 +2797,33 @@ static std::string postProcessISA(const std::string &isa) {
           // The later v_cndmask in the GEMM2 region will use exec predicates
           // and pass through scores unchanged (correct for non-boundary blocks).
           {
-            // Collect side effects within the v_cmp block only (up to lastCmpLineEnd)
-            std::vector<std::string> cmpSideEffects;
+            // Rebuild the compare block in-place, replacing each mask compare with
+            // the corresponding exec predicate write at the same position. This
+            // preserves scalar-address lifetimes like s0/s4 that are still used by
+            // buffer_load instructions before their final compare redefines them.
+            std::vector<std::string> cmpFastLines;
             pos = firstCmpLineStart;
             while (pos < lastCmpLineEnd) {
               size_t le = loop.find('\n', pos);
               if (le == std::string::npos || le >= lastCmpLineEnd) break;
               std::string cl = loop.substr(pos, le - pos);
-              if (cl.find("v_cmp_lt_i32") == std::string::npos &&
-                  cl.find("v_cmp_ge_i32") == std::string::npos &&
-                  cl.find("v_cndmask") == std::string::npos &&
-                  !cl.empty() && cl.find_first_not_of(" \t") != std::string::npos) {
-                cmpSideEffects.push_back(cl);
+              bool isMaskCmp =
+                  (cl.find("v_cmp_") != std::string::npos &&
+                   cl.find(maskDeltaReg) != std::string::npos);
+              if (isMaskCmp) {
+                if (cl.find("vcc") != std::string::npos) {
+                  cmpFastLines.push_back("\ts_mov_b64 vcc, exec");
+                } else {
+                  size_t sB = cl.find("s[");
+                  size_t sE = cl.find("]", sB);
+                  if (sB != std::string::npos && sE != std::string::npos) {
+                    std::string sp = cl.substr(sB, sE - sB + 1);
+                    cmpFastLines.push_back("\ts_mov_b64 " + sp + ", exec");
+                  }
+                }
+              } else if (!cl.empty() &&
+                         cl.find_first_not_of(" \t") != std::string::npos) {
+                cmpFastLines.push_back(cl);
               }
               pos = le + 1;
             }
@@ -2827,10 +2842,7 @@ static std::string postProcessISA(const std::string &isa) {
             std::string fastCode;
             fastCode += "\ts_branch " + mergeLbl + "\n";
             fastCode += fastLbl + ":\n";
-            // Set all mask SGPR pairs to exec so scattered v_cndmask passes through
-            for (const auto &sp : sgprPairs)
-              fastCode += "\ts_mov_b64 " + sp + ", exec\n";
-            for (const auto &sl : cmpSideEffects)
+            for (const auto &sl : cmpFastLines)
               fastCode += sl + "\n";
             fastCode += mergeLbl + ":\n";
             loop.insert(lastCmpLineEnd, fastCode);
@@ -2852,6 +2864,9 @@ static std::string postProcessISA(const std::string &isa) {
         size_t firstMax3Pos = loop.find("v_max3_f32", lastCmpLineEnd);
         if (firstMax3Pos == std::string::npos ||
             firstMax3Pos - lastCmpLineEnd > 600) {
+          mSearchPos = firstCmpLineEnd + 1; continue;
+        }
+        if (lastMax3End == 0 || max3Lines.empty()) {
           mSearchPos = firstCmpLineEnd + 1; continue;
         }
 
