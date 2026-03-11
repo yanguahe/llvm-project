@@ -4540,6 +4540,86 @@ static std::string postProcessISA(const std::string &isa) {
     }
   }
 
+  // --- Pass 15n: Fill the hot post-18852 MFMA->cndmask gap with common-path
+  // VMEM loads.
+  // Current hot-path shape:
+  //   v_mfma_f32_32x32x8_bf16 v[16:31], v[142:143], v[178:179], v[16:31]
+  //   ds_read_b64 v[142:143], v128 offset:17792
+  //   v_cmp_lt_i32_e64 ...
+  //   v_cmp_lt_i32_e64 ...
+  //   v_cndmask_b32_e64 v68, ...
+  //   v_cndmask_b32_e64 v69, ...
+  //   ...
+  //   v_mfma_f32_32x32x8_bf16 v[48:63], v[144:145], v[180:181], v[48:63]
+  //   buffer_load_dword v164/v165/v166/v167, ...
+  // The common-path VMEM quartet only feeds later tail work. Pull it up to right
+  // after the first ds_read so those VMEM issues occupy the MFMA window before the
+  // hottest slot0 cndmask pair.
+  {
+    auto trim = [](const std::string &line) -> std::string {
+      size_t start = 0;
+      while (start < line.size() && (line[start] == ' ' || line[start] == '\t'))
+        start++;
+      size_t end = line.size();
+      while (end > start && (line[end - 1] == ' ' || line[end - 1] == '\t'))
+        end--;
+      return line.substr(start, end - start);
+    };
+
+    std::vector<std::string> allLines;
+    {
+      std::istringstream iss(result);
+      std::string line;
+      while (std::getline(iss, line))
+        allLines.push_back(line);
+    }
+
+    bool modified = false;
+    for (size_t i = 0; i + 21 < allLines.size(); i++) {
+      if (trim(allLines[i]).find(
+              "v_mfma_f32_32x32x8_bf16 v[16:31], v[142:143], v[178:179], "
+              "v[16:31]") != 0 ||
+          trim(allLines[i + 1]).find("ds_read_b64 v[142:143], v128 offset:17792") != 0 ||
+          trim(allLines[i + 2]).find("v_cmp_lt_i32_e64 s[12:13], 9, v127") != 0 ||
+          trim(allLines[i + 3]).find("v_cmp_lt_i32_e64 s[14:15], 10, v127") != 0 ||
+          trim(allLines[i + 4]).find("v_cndmask_b32_e64 v68, v125, v68, s[8:9]") != 0 ||
+          trim(allLines[i + 5]).find("v_cndmask_b32_e64 v69, v125, v69, s[10:11]") != 0 ||
+          trim(allLines[i + 6]).find("v_cmp_lt_i32_e64 s[16:17], 15, v127") != 0 ||
+          trim(allLines[i + 7]).find("v_cmp_lt_i32_e64 s[18:19], 16, v127") != 0 ||
+          trim(allLines[i + 8]) != "s_waitcnt lgkmcnt(0)" ||
+          trim(allLines[i + 9]).find(
+              "v_mfma_f32_32x32x8_bf16 v[0:15], v[142:143], v[178:179], "
+              "v[0:15]") != 0 ||
+          trim(allLines[i + 17]).find(
+              "v_mfma_f32_32x32x8_bf16 v[48:63], v[144:145], v[180:181], "
+              "v[48:63]") != 0 ||
+          trim(allLines[i + 18]).find("buffer_load_dword v164, v137, s[48:51], s55 offen") != 0 ||
+          trim(allLines[i + 19]).find("buffer_load_dword v165, v138, s[48:51], s55 offen") != 0 ||
+          trim(allLines[i + 20]).find("buffer_load_dword v166, v139, s[48:51], s55 offen") != 0 ||
+          trim(allLines[i + 21]).find("buffer_load_dword v167, v140, s[48:51], s55 offen") != 0)
+        continue;
+
+      std::vector<std::string> moved = {
+          allLines[i + 18], allLines[i + 19], allLines[i + 20], allLines[i + 21]};
+      allLines.erase(allLines.begin() + i + 18, allLines.begin() + i + 22);
+      allLines.insert(allLines.begin() + i + 2, moved.begin(), moved.end());
+      llvm::errs() << "[postProcessISA] Pass 15n: Pulled post-18852 common-path "
+                   << "VMEM quartet into MFMA->cndmask gap at line "
+                   << (i + 1) << "\n";
+      modified = true;
+      i += 21;
+    }
+
+    if (modified) {
+      result.clear();
+      for (size_t j = 0; j < allLines.size(); j++) {
+        result += allLines[j];
+        if (j + 1 < allLines.size())
+          result += "\n";
+      }
+    }
+  }
+
   // --- Pass 16: GEMM2 V-read defragmentation ---
   // DISABLED: Pre-loading all 16 V reads causes regression (114.7T → 109.9T).
   // Root cause: causal mask code between first and second MFMA still fragments
