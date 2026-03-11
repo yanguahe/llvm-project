@@ -3564,7 +3564,8 @@ static std::string postProcessISA(const std::string &isa) {
         std::vector<std::string> rebuilt;
         if (!setprioBlock.empty() && prefixLines.empty()) {
           // Keep the first read-then-exp group under the existing wave-priority
-          // split and only re-raise priority once the burst is already underway.
+          // split from the FlyDSL loop entry and only re-raise priority once the
+          // burst is already underway.
           rebuilt.push_back(kLines[0]);
           rebuilt.push_back(expLines[0]);
           rebuilt.push_back(expLines[1]);
