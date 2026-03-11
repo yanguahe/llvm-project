@@ -4456,6 +4456,90 @@ static std::string postProcessISA(const std::string &isa) {
     }
   }
 
+  // --- Pass 15m: Let the hot post-barrier MFMA issue before the second LDS-backed
+  // V load pair finishes setting up. In both common-path handoff tails we have:
+  //   buffer_load_dword v133, ... offen lds
+  //   s_mov_b32 m0, ...
+  //   [optional cndmask / s_nop]
+  //   buffer_load_dword v134, ... offen lds
+  //   s_mov_b32 m0, ...
+  //   v_mfma_f32_32x32x8_bf16 v[32:47], ...
+  // The MFMA is independent of the second LDS-backed load pair, while the load can
+  // overlap with the MFMA. Swap that pair behind the MFMA so the MFMA starts sooner
+  // without changing the earlier v133 issue or the later m0 state for v135.
+  {
+    auto trim = [](const std::string &line) -> std::string {
+      size_t start = 0;
+      while (start < line.size() && (line[start] == ' ' || line[start] == '\t'))
+        start++;
+      size_t end = line.size();
+      while (end > start && (line[end - 1] == ' ' || line[end - 1] == '\t'))
+        end--;
+      return line.substr(start, end - start);
+    };
+
+    std::vector<std::string> allLines;
+    {
+      std::istringstream iss(result);
+      std::string line;
+      while (std::getline(iss, line))
+        allLines.push_back(line);
+    }
+
+    bool modified = false;
+    for (size_t i = 0; i + 6 < allLines.size(); i++) {
+      if (trim(allLines[i]).find("buffer_load_dword v133, s[44:47], s66 offen lds") == 0 &&
+          trim(allLines[i + 1]) == "s_mov_b32 m0, s59" &&
+          trim(allLines[i + 2]).find("v_cndmask_b32_e64 v74, v125, v74, s[20:21]") == 0 &&
+          trim(allLines[i + 3]).find("buffer_load_dword v134, s[44:47], s66 offen lds") == 0 &&
+          trim(allLines[i + 4]) == "s_mov_b32 m0, s61" &&
+          trim(allLines[i + 5]).find(
+              "v_mfma_f32_32x32x8_bf16 v[32:47], v[150:151], v[180:181], "
+              "v[32:47]") == 0 &&
+          trim(allLines[i + 6]).find("buffer_load_dword v135, s[44:47], s66 offen lds") == 0) {
+        std::vector<std::string> moved = {allLines[i + 3], allLines[i + 4]};
+        std::string mfma = allLines[i + 5];
+        allLines.erase(allLines.begin() + i + 3, allLines.begin() + i + 6);
+        allLines.insert(allLines.begin() + i + 3, mfma);
+        allLines.insert(allLines.begin() + i + 4, moved.begin(), moved.end());
+        llvm::errs() << "[postProcessISA] Pass 15m: Moved post-18852 second LDS "
+                     << "load pair behind hot MFMA at line " << (i + 3) << "\n";
+        modified = true;
+        i += 6;
+        continue;
+      }
+
+      if (trim(allLines[i]).find("buffer_load_dword v133, s[44:47], s0 offen lds") == 0 &&
+          trim(allLines[i + 1]) == "s_mov_b32 m0, s65" &&
+          trim(allLines[i + 2]) == "s_nop 0" &&
+          trim(allLines[i + 3]).find("buffer_load_dword v134, s[44:47], s0 offen lds") == 0 &&
+          trim(allLines[i + 4]) == "s_mov_b32 m0, s73" &&
+          trim(allLines[i + 5]).find(
+              "v_mfma_f32_32x32x8_bf16 v[32:47], v[150:151], v[178:179], "
+              "v[32:47]") == 0 &&
+          trim(allLines[i + 6]).find("buffer_load_dword v135, s[44:47], s0 offen lds") == 0) {
+        std::vector<std::string> moved = {allLines[i + 3], allLines[i + 4]};
+        std::string mfma = allLines[i + 5];
+        allLines.erase(allLines.begin() + i + 3, allLines.begin() + i + 6);
+        allLines.insert(allLines.begin() + i + 3, mfma);
+        allLines.insert(allLines.begin() + i + 4, moved.begin(), moved.end());
+        llvm::errs() << "[postProcessISA] Pass 15m: Moved post-20936 second LDS "
+                     << "load pair behind hot MFMA at line " << (i + 3) << "\n";
+        modified = true;
+        i += 6;
+      }
+    }
+
+    if (modified) {
+      result.clear();
+      for (size_t j = 0; j < allLines.size(); j++) {
+        result += allLines[j];
+        if (j + 1 < allLines.size())
+          result += "\n";
+      }
+    }
+  }
+
   // --- Pass 16: GEMM2 V-read defragmentation ---
   // DISABLED: Pre-loading all 16 V reads causes regression (114.7T → 109.9T).
   // Root cause: causal mask code between first and second MFMA still fragments
