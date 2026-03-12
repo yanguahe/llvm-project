@@ -560,6 +560,9 @@ void initializeSIFixSetprioPlacementPass(PassRegistry &);
 FunctionPass *createSIFixDsReadPlacementPass();
 void initializeSIFixDsReadPlacementPass(PassRegistry &);
 
+FunctionPass *createSIFixDsReadInterleavePass();
+void initializeSIFixDsReadInterleavePass(PassRegistry &);
+
 void initializeGCNRewritePartialRegUsesLegacyPass(llvm::PassRegistry &);
 extern char &GCNRewritePartialRegUsesID;
 

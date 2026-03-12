@@ -593,6 +593,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAMDGPUTarget() {
   initializeSIWholeQuadModeLegacyPass(*PR);
   initializeSILowerControlFlowLegacyPass(*PR);
   initializeSIPreEmitPeepholeLegacyPass(*PR);
+  initializeSIFixDsReadInterleavePass(*PR);
   initializeSIFixDsReadPlacementPass(*PR);
   initializeSIFixSetprioPlacementPass(*PR);
   initializeSILateBranchLoweringLegacyPass(*PR);
@@ -1812,6 +1813,7 @@ void GCNPassConfig::addPreEmitPass() {
     addPass(&GCNCreateVOPDID);
   addPass(createSIMemoryLegalizerPass());
   addPass(createSIFixDsReadPlacementPass());
+  addPass(createSIFixDsReadInterleavePass());
   addPass(createSIInsertWaitcntsPass());
 
   addPass(createSIModeRegisterPass());
