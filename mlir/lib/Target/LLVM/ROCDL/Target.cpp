@@ -4941,6 +4941,166 @@ static std::string postProcessISA(const std::string &isa) {
   // barrier stall reduction. Our s_setprio placement (around GEMM1) differs
   // from reference ASM (around O rescale), so the yield timing doesn't help.
 
+  // --- Pass 26: Post-chain handoff spacing knobs ---
+  // Keep all Pass 15/15b-15n/25 matcher anchors identical. Only after the full
+  // fragile rewrite chain has finished do we adjust a few repeated handoff
+  // preludes in the FINAL ISA text.
+  //
+  // Knobs (read at runtime so multiple variants can be tested without rebuilding):
+  //   FLIR_PASS26_DISABLE=1
+  //     Skip the pass entirely and keep the pre-Pass26 final ISA for A/B runs.
+  //
+  //   FLIR_PASS26_LOOPTOP_NOP
+  //     Rewrites the already-present loop-top handoff nop block:
+  //       s_setprio 0 / s_setprio 1 / s_nop 0
+  //     into
+  //       s_setprio 0 / s_nop N / s_setprio 1
+  //     where N defaults to 0 (the current winner).
+  //
+  //   FLIR_PASS26_POSTMFMA_NOP
+  //     Inserts a new ASMSTART/s_nop N/ASMEND block after repeated
+  //     post-MFMA `s_setprio 0` handoffs whose next region is a SALU+lgkmcnt
+  //     prelude followed immediately by another MFMA chain. Disabled by default.
+  {
+    auto trim = [](const std::string &line) -> std::string {
+      size_t start = 0;
+      while (start < line.size() && (line[start] == ' ' || line[start] == '\t'))
+        start++;
+      size_t end = line.size();
+      while (end > start && (line[end - 1] == ' ' || line[end - 1] == '\t'))
+        end--;
+      return line.substr(start, end - start);
+    };
+    auto parseEnvInt = [](const char *name, int defaultVal) -> int {
+      const char *v = std::getenv(name);
+      if (!v || !*v)
+        return defaultVal;
+      char *end = nullptr;
+      long parsed = std::strtol(v, &end, 10);
+      if (end == v || (end && *end != '\0'))
+        return defaultVal;
+      if (parsed < -1)
+        return defaultVal;
+      if (parsed > 15)
+        return defaultVal;
+      return static_cast<int>(parsed);
+    };
+    auto makeAsmBlock = [](const std::string &inst) -> std::vector<std::string> {
+      return {"\t;;#ASMSTART", "\t" + inst, "\t;;#ASMEND"};
+    };
+
+    const bool disablePass26 = []() {
+      const char *v = std::getenv("FLIR_PASS26_DISABLE");
+      if (!v)
+        return false;
+      std::string s(v);
+      for (char &c : s)
+        c = static_cast<char>(::tolower(c));
+      return s == "1" || s == "true" || s == "yes" || s == "on";
+    }();
+    const int loopTopNop = parseEnvInt("FLIR_PASS26_LOOPTOP_NOP", 0);
+    const int postMfmaNop = parseEnvInt("FLIR_PASS26_POSTMFMA_NOP", -1);
+
+    if (!disablePass26) {
+      std::vector<std::string> allLines;
+      {
+        std::istringstream iss(result);
+        std::string line;
+        while (std::getline(iss, line))
+          allLines.push_back(line);
+      }
+
+      bool modified = false;
+      unsigned loopTopModified = 0;
+      unsigned postMfmaModified = 0;
+      for (size_t i = 0; i + 10 < allLines.size(); i++) {
+        if (trim(allLines[i]) != ";;#ASMSTART" ||
+            trim(allLines[i + 1]) != "s_setprio 0" ||
+            trim(allLines[i + 2]) != ";;#ASMEND" ||
+            trim(allLines[i + 3]) != ";;#ASMSTART" ||
+            trim(allLines[i + 4]) != "s_setprio 1" ||
+            trim(allLines[i + 5]) != ";;#ASMEND" ||
+            trim(allLines[i + 6]) != ";;#ASMSTART" ||
+            trim(allLines[i + 7]) != "s_nop 0" ||
+            trim(allLines[i + 8]) != ";;#ASMEND" ||
+            trim(allLines[i + 9]) != "s_waitcnt vmcnt(2)" ||
+            trim(allLines[i + 10]).find("v_perm_b32") != 0)
+          continue;
+
+        std::vector<std::string> sp0Block(allLines.begin() + i,
+                                          allLines.begin() + i + 3);
+        std::vector<std::string> sp1Block(allLines.begin() + i + 3,
+                                          allLines.begin() + i + 6);
+        std::vector<std::string> nopBlock(allLines.begin() + i + 6,
+                                          allLines.begin() + i + 9);
+        nopBlock[1] = "\ts_nop " + std::to_string(loopTopNop);
+
+        std::copy(sp0Block.begin(), sp0Block.end(), allLines.begin() + i);
+        std::copy(nopBlock.begin(), nopBlock.end(), allLines.begin() + i + 3);
+        std::copy(sp1Block.begin(), sp1Block.end(), allLines.begin() + i + 6);
+
+        llvm::errs() << "[postProcessISA] Pass 26: Retimed loop-top handoff to "
+                     << "s_nop " << loopTopNop << " at line " << (i + 1) << "\n";
+        modified = true;
+        loopTopModified++;
+        i += 8;
+      }
+
+      if (postMfmaNop >= 0) {
+        for (size_t i = 1; i + 2 < allLines.size(); i++) {
+          if (trim(allLines[i - 1]).find("v_mfma") != 0 ||
+              trim(allLines[i]) != ";;#ASMSTART" ||
+              trim(allLines[i + 1]) != "s_setprio 0" ||
+              trim(allLines[i + 2]) != ";;#ASMEND")
+            continue;
+
+          bool sawLgkmWait = false;
+          bool sawNextMfma = false;
+          for (size_t j = i + 3; j < std::min(i + 9, allLines.size()); j++) {
+            if (trim(allLines[j]) == "s_waitcnt lgkmcnt(0)") {
+              sawLgkmWait = true;
+              break;
+            }
+          }
+          for (size_t j = i + 3; j < std::min(i + 13, allLines.size()); j++) {
+            if (trim(allLines[j]).find("v_mfma") == 0) {
+              sawNextMfma = true;
+              break;
+            }
+          }
+          if (!sawLgkmWait || !sawNextMfma)
+            continue;
+
+          std::vector<std::string> nopBlock =
+              makeAsmBlock("s_nop " + std::to_string(postMfmaNop));
+          allLines.insert(allLines.begin() + i + 3, nopBlock.begin(),
+                          nopBlock.end());
+          llvm::errs() << "[postProcessISA] Pass 26: Inserted post-MFMA handoff "
+                       << "s_nop " << postMfmaNop << " after line " << (i + 1)
+                       << "\n";
+          modified = true;
+          postMfmaModified++;
+          i += 5;
+        }
+      }
+
+      if (modified) {
+        result.clear();
+        for (size_t j = 0; j < allLines.size(); j++) {
+          result += allLines[j];
+          if (j + 1 < allLines.size())
+            result += "\n";
+        }
+      }
+      if (loopTopModified || postMfmaModified) {
+        llvm::errs() << "[postProcessISA] Pass 26 summary: loopTop="
+                     << loopTopModified << ", postMfma=" << postMfmaModified
+                     << " (loopTopNop=" << loopTopNop
+                     << ", postMfmaNop=" << postMfmaNop << ")\n";
+      }
+    }
+  }
+
   {
     static int dumpIdx = 0;
     std::string dumpPath =
