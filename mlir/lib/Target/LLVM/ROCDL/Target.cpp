@@ -4853,6 +4853,149 @@ static std::string postProcessISA(const std::string &isa) {
     }
   }
 
+  // --- Pass 15o: Remove identity cndmask operations fed by SGPR masks that were
+  // just materialized from exec in the same block.
+  // Hot-path shape:
+  //   s_mov_b64 s[4:5], exec
+  //   ...
+  //   v_cndmask_b32_e64 v66, v193, v66, s[4:5]
+  // When the mask is literally exec, the cndmask always selects the second VGPR
+  // operand, so `v66 = cndmask(..., v66, exec)` is a pure no-op. Drop these
+  // identity cndmask instructions while leaving the surrounding control flow and
+  // SGPR setup untouched.
+  {
+    auto trim = [](const std::string &line) -> std::string {
+      size_t start = 0;
+      while (start < line.size() && (line[start] == ' ' || line[start] == '\t'))
+        start++;
+      size_t end = line.size();
+      while (end > start && (line[end - 1] == ' ' || line[end - 1] == '\t'))
+        end--;
+      return line.substr(start, end - start);
+    };
+
+    auto startsWith = [&](const std::string &line, const char *prefix) -> bool {
+      return trim(line).find(prefix) == 0;
+    };
+
+    auto parseExecPair = [&](const std::string &line, unsigned &lo,
+                             unsigned &hi) -> bool {
+      std::string t = trim(line);
+      if (!startsWith(t, "s_mov_b64 s["))
+        return false;
+      size_t l = t.find('[');
+      size_t colon = t.find(':', l + 1);
+      size_t r = t.find(']', colon + 1);
+      if (colon == std::string::npos || r == std::string::npos)
+        return false;
+      lo = std::stoul(t.substr(l + 1, colon - (l + 1)));
+      hi = std::stoul(t.substr(colon + 1, r - (colon + 1)));
+      return hi == lo + 1 && t.substr(r) == "], exec";
+    };
+
+    auto parsePairDest = [&](const std::string &line, unsigned &lo,
+                             unsigned &hi) -> bool {
+      std::string t = trim(line);
+      size_t space = t.find(' ');
+      if (space == std::string::npos || t.find("s[", space + 1) != space + 1)
+        return false;
+      size_t colon = t.find(':', space + 3);
+      size_t r = t.find(']', colon + 1);
+      size_t comma = t.find(',', r + 1);
+      if (colon == std::string::npos || r == std::string::npos ||
+          comma == std::string::npos)
+        return false;
+      lo = std::stoul(t.substr(space + 3, colon - (space + 3)));
+      hi = std::stoul(t.substr(colon + 1, r - (colon + 1)));
+      return hi == lo + 1;
+    };
+
+    auto parseIdentityExecCndmask = [&](const std::string &line, unsigned &lo,
+                                        unsigned &hi) -> bool {
+      std::string t = trim(line);
+      if (!startsWith(t, "v_cndmask_b32_e64 v"))
+        return false;
+      constexpr size_t prefixLen = sizeof("v_cndmask_b32_e64 v") - 1;
+      size_t comma1 = t.find(',');
+      size_t comma2 = t.find(',', comma1 + 1);
+      size_t comma3 = t.find(',', comma2 + 1);
+      if (comma1 == std::string::npos || comma2 == std::string::npos ||
+          comma3 == std::string::npos)
+        return false;
+      unsigned dst = std::stoul(t.substr(prefixLen, comma1 - prefixLen));
+      size_t src2v = t.find('v', comma2 + 1);
+      size_t src2End = t.find(',', src2v + 1);
+      if (src2v == std::string::npos || src2End != comma3)
+        return false;
+      unsigned src2 = std::stoul(t.substr(src2v + 1, src2End - (src2v + 1)));
+      size_t sbr = t.find("s[", comma3 + 1);
+      size_t colon = t.find(':', sbr + 2);
+      size_t r = t.find(']', colon + 1);
+      if (sbr == std::string::npos || colon == std::string::npos ||
+          r == std::string::npos)
+        return false;
+      lo = std::stoul(t.substr(sbr + 2, colon - (sbr + 2)));
+      hi = std::stoul(t.substr(colon + 1, r - (colon + 1)));
+      return dst == src2 && hi == lo + 1;
+    };
+
+    std::vector<std::string> allLines;
+    {
+      std::istringstream iss(result);
+      std::string line;
+      while (std::getline(iss, line))
+        allLines.push_back(line);
+    }
+
+    bool modified = false;
+    std::vector<bool> execPairs(128, false);
+    unsigned removed = 0;
+    for (size_t i = 0; i < allLines.size(); i++) {
+      std::string t = trim(allLines[i]);
+      if (t.empty())
+        continue;
+      if (t.back() == ':') {
+        for (size_t k = 0; k < execPairs.size(); k++)
+          execPairs[k] = false;
+        continue;
+      }
+
+      unsigned lo = 0, hi = 0;
+      if (parseExecPair(t, lo, hi)) {
+        if (lo < execPairs.size())
+          execPairs[lo] = true;
+        continue;
+      }
+
+      if (parseIdentityExecCndmask(t, lo, hi) && lo < execPairs.size() &&
+          execPairs[lo]) {
+        llvm::errs() << "[postProcessISA] Pass 15o: Removed exec-driven identity "
+                     << "cndmask at line " << (i + 1) << "\n";
+        allLines.erase(allLines.begin() + i);
+        modified = true;
+        removed++;
+        if (i > 0)
+          i--;
+        continue;
+      }
+
+      if (parsePairDest(t, lo, hi))
+        if (lo < execPairs.size())
+          execPairs[lo] = false;
+    }
+
+    if (modified) {
+      llvm::errs() << "[postProcessISA] Pass 15o summary: removed=" << removed
+                   << "\n";
+      result.clear();
+      for (size_t j = 0; j < allLines.size(); j++) {
+        result += allLines[j];
+        if (j + 1 < allLines.size())
+          result += "\n";
+      }
+    }
+  }
+
   // --- Pass 15k: Fill the post-20936 GEMM2 lgkm wait with common-path SALU.
   // Current hot-path shape:
   //   s_and_b64 s[0:1], vcc, exec
