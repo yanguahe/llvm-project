@@ -2332,6 +2332,148 @@ static std::string restructureGEMM2_V3(std::string loop, const std::string &labe
 static std::string postProcessISA(const std::string &isa) {
   std::string result = isa;
 
+  auto trimIsaLine = [](const std::string &line) -> std::string {
+    size_t start = 0;
+    while (start < line.size() && (line[start] == ' ' || line[start] == '\t'))
+      start++;
+    size_t end = line.size();
+    while (end > start && (line[end - 1] == ' ' || line[end - 1] == '\t'))
+      end--;
+    return line.substr(start, end - start);
+  };
+
+  auto parseLgkmCount = [&](const std::string &line) -> int {
+    std::string t = trimIsaLine(line);
+    size_t pos = t.find("lgkmcnt(");
+    if (pos == std::string::npos)
+      return -1;
+    size_t numStart = pos + 8;
+    size_t numEnd = t.find(')', numStart);
+    if (numEnd == std::string::npos)
+      return -1;
+    return atoi(t.substr(numStart, numEnd - numStart).c_str());
+  };
+
+  auto splitIsaLines = [](const std::string &text) -> std::vector<std::string> {
+    std::vector<std::string> lines;
+    std::istringstream iss(text);
+    std::string line;
+    while (std::getline(iss, line))
+      lines.push_back(line);
+    return lines;
+  };
+
+  auto isWaitRestoreAnchorSkippable = [&](const std::string &line) -> bool {
+    return line.empty() || line == ";;#ASMSTART" || line == ";;#ASMEND" ||
+           line.find("s_waitcnt") == 0 || line.find("s_barrier") == 0 ||
+           line.find("s_setprio") == 0 || line.find("s_nop") == 0;
+  };
+
+  auto annotateWaitAnchorLines = [&](const std::vector<std::string> &lines,
+                                     std::vector<std::string> &labels,
+                                     std::vector<int> &mfmaOrdinals,
+                                     std::vector<int> &dsReadOrdinals,
+                                     std::vector<int> &vAddOrdinals) {
+    labels.assign(lines.size(), "");
+    mfmaOrdinals.assign(lines.size(), -1);
+    dsReadOrdinals.assign(lines.size(), -1);
+    vAddOrdinals.assign(lines.size(), -1);
+
+    std::string currentLabel;
+    std::map<std::string, int> nextMfmaOrdinal;
+    std::map<std::string, int> nextDsReadOrdinal;
+    std::map<std::string, int> nextVAddOrdinal;
+    for (size_t i = 0; i < lines.size(); i++) {
+      std::string t = trimIsaLine(lines[i]);
+      if (!t.empty() && t[0] == '.' && t.back() == ':') {
+        currentLabel = t.substr(0, t.size() - 1);
+      }
+      labels[i] = currentLabel;
+      if (!currentLabel.empty() && t.find("v_mfma") == 0) {
+        mfmaOrdinals[i] = nextMfmaOrdinal[currentLabel]++;
+      }
+      if (!currentLabel.empty() && t.find("ds_read") == 0) {
+        dsReadOrdinals[i] = nextDsReadOrdinal[currentLabel]++;
+      }
+      if (!currentLabel.empty() && t.find("v_add_f32") == 0) {
+        vAddOrdinals[i] = nextVAddOrdinal[currentLabel]++;
+      }
+    }
+  };
+
+  auto makeWaitRestoreKey = [&](const std::string &kind,
+                                const std::string &label, int ordinal,
+                                const std::string &anchor) -> std::string {
+    return kind + "|" + label + "#" + std::to_string(ordinal) + "|" + anchor;
+  };
+
+  auto makeRelaxedWaitRestoreKey = [&](const std::string &kind,
+                                       const std::string &label,
+                                       const std::string &anchor)
+      -> std::string { return kind + "|" + label + "|" + anchor; };
+
+  auto buildOriginalLgkmWaitMap =
+      [&](const std::string &text) -> std::map<std::string, unsigned> {
+    std::vector<std::string> lines = splitIsaLines(text);
+    std::vector<std::string> labels;
+    std::vector<int> mfmaOrdinals;
+    std::vector<int> dsReadOrdinals;
+    std::vector<int> vAddOrdinals;
+    annotateWaitAnchorLines(lines, labels, mfmaOrdinals, dsReadOrdinals,
+                            vAddOrdinals);
+
+    std::map<std::string, unsigned> waits;
+    for (size_t i = 0; i < lines.size(); i++) {
+      const int lgkmCnt = parseLgkmCount(lines[i]);
+      if (lgkmCnt <= 0 || labels[i].empty())
+        continue;
+
+      for (size_t j = i + 1; j < lines.size() && j <= i + 32; j++) {
+        if (labels[j] != labels[i])
+          break;
+        std::string anchor = trimIsaLine(lines[j]);
+        if (isWaitRestoreAnchorSkippable(anchor))
+          continue;
+
+        if (anchor.find("ds_read") == 0 && dsReadOrdinals[j] >= 0) {
+          waits.emplace(makeWaitRestoreKey("dsread", labels[j],
+                                           dsReadOrdinals[j], anchor),
+                        static_cast<unsigned>(lgkmCnt));
+          waits.emplace(makeRelaxedWaitRestoreKey("dsread", labels[j], anchor),
+                        static_cast<unsigned>(lgkmCnt));
+          break;
+        }
+        if (anchor.find("v_add_f32") == 0 && vAddOrdinals[j] >= 0) {
+          waits.emplace(makeWaitRestoreKey("vadd", labels[j], vAddOrdinals[j],
+                                           anchor),
+                        static_cast<unsigned>(lgkmCnt));
+          waits.emplace(makeRelaxedWaitRestoreKey("vadd", labels[j], anchor),
+                        static_cast<unsigned>(lgkmCnt));
+          break;
+        }
+        if (anchor.find("v_mfma") == 0 && mfmaOrdinals[j] >= 0) {
+          waits.emplace(makeWaitRestoreKey("mfma", labels[j], mfmaOrdinals[j],
+                                           anchor),
+                        static_cast<unsigned>(lgkmCnt));
+          break;
+        }
+      }
+    }
+    return waits;
+  };
+
+  const std::map<std::string, unsigned> originalLgkmWaits =
+      buildOriginalLgkmWaitMap(isa);
+  const bool preserveBackendLgkmWaits = []() {
+    const char *v = std::getenv("FLIR_PRESERVE_MFMA_LGKMCNT");
+    if (!v)
+      return true;
+    std::string s(v);
+    for (char &c : s)
+      c = static_cast<char>(::tolower(c));
+    return !(s == "0" || s == "false" || s == "no" || s == "off");
+  }();
+
   // Find all inner loop labels with backward branch.
   // Detect both s_cbranch_vccnz and s_branch (unconditional) patterns,
   // since scf.if/else inside loops may change the backward branch type.
@@ -5109,6 +5251,191 @@ static std::string postProcessISA(const std::string &isa) {
     llvm::raw_fd_ostream dumpFile(dumpPath, ec);
     if (!ec)
       dumpFile << result;
+  }
+
+  // Preserve backend-emitted non-zero lgkm waits for the hottest consumer
+  // families that post-processing can otherwise flatten to lgkmcnt(0):
+  // MFMA, barrier-handoff ds_read bursts, and v_add handoffs after permutes.
+  // The earlier text-rewrite passes still operate on their historical
+  // lgkmcnt(0) anchors, then we restore the backend count at the very end.
+  {
+    if (preserveBackendLgkmWaits && !originalLgkmWaits.empty()) {
+      std::vector<std::string> allLines = splitIsaLines(result);
+      std::vector<std::string> labels;
+      std::vector<int> mfmaOrdinals;
+      std::vector<int> dsReadOrdinals;
+      std::vector<int> vAddOrdinals;
+      annotateWaitAnchorLines(allLines, labels, mfmaOrdinals, dsReadOrdinals,
+                              vAddOrdinals);
+
+      bool modified = false;
+      unsigned restored = 0;
+      unsigned restoredMfma = 0;
+      unsigned restoredDsRead = 0;
+      unsigned restoredVAdd = 0;
+      std::set<std::string> restoredKeys;
+      auto tryRestoreForAnchor =
+          [&](size_t waitIdx, const std::string &kind, const std::string &label,
+              int ordinal, const std::string &anchor) -> bool {
+        std::string key = makeWaitRestoreKey(kind, label, ordinal, anchor);
+        std::string relaxedKey = makeRelaxedWaitRestoreKey(kind, label, anchor);
+        auto it = originalLgkmWaits.find(key);
+        std::string chosenKey = key;
+        if (it == originalLgkmWaits.end() && kind != "mfma") {
+          it = originalLgkmWaits.find(relaxedKey);
+          chosenKey = relaxedKey;
+        }
+        if (it == originalLgkmWaits.end() || restoredKeys.count(chosenKey))
+          return false;
+
+        size_t lgkmPos = allLines[waitIdx].find("lgkmcnt(");
+        if (lgkmPos == std::string::npos)
+          return false;
+        size_t numStart = lgkmPos + 8;
+        size_t numEnd = allLines[waitIdx].find(')', numStart);
+        if (numEnd == std::string::npos)
+          return false;
+
+        allLines[waitIdx].replace(numStart, numEnd - numStart,
+                                  std::to_string(it->second));
+        restoredKeys.insert(chosenKey);
+        restored++;
+        modified = true;
+        if (kind == "mfma")
+          restoredMfma++;
+        else if (kind == "dsread")
+          restoredDsRead++;
+        else if (kind == "vadd")
+          restoredVAdd++;
+        return true;
+      };
+      for (size_t i = 0; i < allLines.size(); i++) {
+        if (parseLgkmCount(allLines[i]) != 0 || labels[i].empty())
+          continue;
+
+        for (size_t j = i + 1; j < allLines.size() && j <= i + 32; j++) {
+          if (labels[j] != labels[i])
+            break;
+          std::string anchor = trimIsaLine(allLines[j]);
+          if (isWaitRestoreAnchorSkippable(anchor))
+            continue;
+
+          if (anchor.find("ds_read") == 0 && dsReadOrdinals[j] >= 0) {
+            tryRestoreForAnchor(i, "dsread", labels[j], dsReadOrdinals[j],
+                                anchor);
+            break;
+          }
+          if (anchor.find("v_add_f32") == 0 && vAddOrdinals[j] >= 0) {
+            tryRestoreForAnchor(i, "vadd", labels[j], vAddOrdinals[j], anchor);
+            break;
+          }
+          if (anchor.find("v_mfma") == 0 && mfmaOrdinals[j] >= 0) {
+            tryRestoreForAnchor(i, "mfma", labels[j], mfmaOrdinals[j], anchor);
+            break;
+          }
+        }
+      }
+
+      if (modified) {
+        result.clear();
+        for (size_t j = 0; j < allLines.size(); j++) {
+          result += allLines[j];
+          if (j + 1 < allLines.size())
+            result += "\n";
+        }
+        llvm::errs() << "[postProcessISA] Restored " << restored
+                     << " lgkm waits to backend-emitted non-zero counts"
+                     << " (mfma=" << restoredMfma
+                     << ", dsread=" << restoredDsRead
+                     << ", vadd=" << restoredVAdd << ")\n";
+      }
+    }
+  }
+
+  // --- Pass 28: Minimal loop back-edge phase offset ---
+  // Final dual-group attempt: keep the whole frontend and fragile Pass
+  // 15/25/26 chain unchanged, and only add a tiny fixed delay at the loop
+  // back-edge. The intent is to create a natural inter-wave phase offset
+  // without changing priorities, register pressure, or control flow.
+  {
+    auto parseBackedgeNop = [](const char *name, int defaultVal) -> int {
+      const char *v = std::getenv(name);
+      if (!v || !*v)
+        return defaultVal;
+      char *end = nullptr;
+      long parsed = std::strtol(v, &end, 10);
+      if (end == v || (end && *end != '\0'))
+        return defaultVal;
+      if (parsed < 0 || parsed > 4)
+        return defaultVal;
+      return static_cast<int>(parsed);
+    };
+    const bool disablePass28 = []() {
+      const char *v = std::getenv("FLIR_PASS28_DISABLE");
+      if (!v)
+        return false;
+      std::string s(v);
+      for (char &c : s)
+        c = static_cast<char>(::tolower(c));
+      return s == "1" || s == "true" || s == "yes" || s == "on";
+    }();
+    const int backedgeNop = parseBackedgeNop("FLIR_PASS28_BACKEDGE_NOP", 1);
+
+    if (!disablePass28 && backedgeNop > 0) {
+      std::vector<std::string> allLines = splitIsaLines(result);
+      std::map<std::string, size_t> firstLabelLine;
+
+      for (size_t i = 0; i < allLines.size(); ++i) {
+        std::string t = trimIsaLine(allLines[i]);
+        if (t.empty() || t[0] != '.')
+          continue;
+        size_t colonPos = t.find(':');
+        if (colonPos == std::string::npos)
+          continue;
+        std::string label = t.substr(0, colonPos);
+        firstLabelLine.emplace(label, i);
+      }
+
+      bool modified = false;
+      unsigned inserted = 0;
+      for (size_t i = 0; i < allLines.size(); ++i) {
+        std::string t = trimIsaLine(allLines[i]);
+        if (!(t.find("s_cbranch_vccnz ") == 0 || t.find("s_branch ") == 0))
+          continue;
+
+        size_t spacePos = t.find(' ');
+        if (spacePos == std::string::npos)
+          continue;
+        std::string target = t.substr(spacePos + 1);
+        auto labelIt = firstLabelLine.find(target);
+        if (labelIt == firstLabelLine.end() || labelIt->second >= i)
+          continue;
+
+        if (i > 0 && trimIsaLine(allLines[i - 1]) ==
+                         ("s_nop " + std::to_string(backedgeNop)))
+          continue;
+
+        allLines.insert(allLines.begin() + i,
+                        "\ts_nop " + std::to_string(backedgeNop));
+        llvm::errs() << "[postProcessISA] Pass 28: Inserted loop back-edge "
+                     << "s_nop " << backedgeNop << " before " << t
+                     << " at line " << (i + 1) << "\n";
+        modified = true;
+        inserted++;
+        i++;
+      }
+
+      if (modified) {
+        result.clear();
+        for (size_t j = 0; j < allLines.size(); ++j) {
+          result += allLines[j];
+          if (j + 1 < allLines.size())
+            result += "\n";
+        }
+        llvm::errs() << "[postProcessISA] Pass 28 summary: inserted="
+                     << inserted << " (backedgeNop=" << backedgeNop << ")\n";
+      }
+    }
   }
 
   return result;
