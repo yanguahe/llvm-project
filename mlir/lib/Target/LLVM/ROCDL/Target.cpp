@@ -2331,6 +2331,16 @@ static std::string restructureGEMM2_V3(std::string loop, const std::string &labe
 
 static std::string postProcessISA(const std::string &isa) {
   std::string result = isa;
+  auto envEnabled = [](const char *name) {
+    const char *v = std::getenv(name);
+    if (!v)
+      return false;
+    std::string s(v);
+    for (char &c : s)
+      c = static_cast<char>(::tolower(c));
+    return s == "1" || s == "true" || s == "yes" || s == "on";
+  };
+  const bool disableMaskSkip = envEnabled("FLIR_MASK_SKIP_DISABLE");
 
   auto trimIsaLine = [](const std::string &line) -> std::string {
     size_t start = 0;
@@ -2633,14 +2643,15 @@ static std::string postProcessISA(const std::string &isa) {
     // static int g_maxNewVgpr = 0;
     // loop = restructureGEMM2_V3(std::move(loop), label, g_maxNewVgpr);
 
-    // --- Pass 10: Scalar branch to skip causal mask for non-boundary blocks ---
-    // Generalized: matches ANY SGPR pair (not just s[0:1]), handles up to 2
-    // bodies per loop. Two sub-cases:
-    //   A) Tight v_cmp+v_cndmask block (cndCount >= 14): skip entire block
-    //   B) v_cmp-only block with scattered v_cndmask: skip v_cmp, set SGPRs
-    //      to exec so later v_cndmask passes through scores unchanged
-    unsigned maskBranchesAdded = 0;
-    if (loopBarriers > 2) {
+    if (!disableMaskSkip) {
+      // --- Pass 10: Scalar branch to skip causal mask for non-boundary blocks ---
+      // Generalized: matches ANY SGPR pair (not just s[0:1]), handles up to 2
+      // bodies per loop. Two sub-cases:
+      //   A) Tight v_cmp+v_cndmask block (cndCount >= 14): skip entire block
+      //   B) v_cmp-only block with scattered v_cndmask: skip v_cmp, set SGPRs
+      //      to exec so later v_cndmask passes through scores unchanged
+      unsigned maskBranchesAdded = 0;
+      if (loopBarriers > 2) {
       size_t mSearchPos = 0;
       while (maskBranchesAdded < 2) {
         // Find start of ANY mask block: v_cmp_lt_i32_e64 s[
@@ -3163,6 +3174,7 @@ static std::string postProcessISA(const std::string &isa) {
 
         maskBranchesAdded++;
         mSearchPos = bLastCmpEnd + bFast.size();
+      }
       }
     }
 
