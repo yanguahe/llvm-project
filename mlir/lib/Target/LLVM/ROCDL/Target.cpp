@@ -2341,6 +2341,9 @@ static std::string postProcessISA(const std::string &isa) {
     return s == "1" || s == "true" || s == "yes" || s == "on";
   };
   const bool disableMaskSkip = envEnabled("FLIR_MASK_SKIP_DISABLE");
+  const bool splitMaskSkipPass1Only =
+      envEnabled("FLIR_MASK_SKIP_SPLIT_PASS1_ONLY");
+  const bool debugMaskSkip = envEnabled("FLIR_MASK_SKIP_DEBUG");
 
   auto trimIsaLine = [](const std::string &line) -> std::string {
     size_t start = 0;
@@ -2518,6 +2521,39 @@ static std::string postProcessISA(const std::string &isa) {
     }
   }
 
+  auto countLoopBarriers = [&](const std::string &body) {
+    unsigned count = 0;
+    size_t bpos = 0;
+    while (true) {
+      size_t b = body.find("s_barrier", bpos);
+      if (b == std::string::npos)
+        break;
+      count++;
+      bpos = b + 10;
+    }
+    return count;
+  };
+
+  unsigned totalMultiBodyLoops = 0;
+  for (const auto &label : loopLabels) {
+    std::string labelColon = label + ":";
+    std::string branchTarget = loopBranchPattern[label];
+    size_t loopStart = result.find(labelColon);
+    if (loopStart == std::string::npos)
+      continue;
+    size_t loopEnd = result.find(branchTarget, loopStart);
+    if (loopEnd == std::string::npos)
+      continue;
+    size_t loopEndLine = result.find('\n', loopEnd);
+    if (loopEndLine == std::string::npos)
+      loopEndLine = result.size();
+    std::string loop = result.substr(loopStart, loopEndLine - loopStart);
+    if (countLoopBarriers(loop) > 2)
+      totalMultiBodyLoops++;
+  }
+
+  unsigned multiBodyLoopOrdinal = 0;
+
   for (const auto &label : loopLabels) {
     std::string labelColon = label + ":";
     std::string branchTarget = loopBranchPattern[label];
@@ -2537,20 +2573,25 @@ static std::string postProcessISA(const std::string &isa) {
     std::string loop = result.substr(loopStart, loopEndLine - loopStart);
 
     // Count barriers to detect 2x unrolled loops (>2 barriers = multi-body)
-    unsigned loopBarriers = 0;
-    {
-      size_t bpos = 0;
-      while (true) {
-        size_t b = loop.find("s_barrier", bpos);
-        if (b == std::string::npos) break;
-        loopBarriers++;
-        bpos = b + 10;
-      }
-    }
+    unsigned loopBarriers = countLoopBarriers(loop);
     bool doYield = (loopBarriers > 2);
     bool fillGap = false;
     bool hoistVcmp = (loopBarriers <= 2);
     loop = processOneLoop(std::move(loop), label, doYield, fillGap, hoistVcmp);
+
+    bool allowMaskSkipThisLoop = !disableMaskSkip;
+    if (loopBarriers > 2) {
+      if (splitMaskSkipPass1Only && totalMultiBodyLoops > 0) {
+        unsigned pass1Start = totalMultiBodyLoops / 2;
+        allowMaskSkipThisLoop = allowMaskSkipThisLoop &&
+                                (multiBodyLoopOrdinal >= pass1Start);
+        llvm::errs() << "[postProcessISA] mask-skip split-pass1-only: "
+                     << (allowMaskSkipThisLoop ? "enable " : "disable ")
+                     << label << " ordinal=" << multiBodyLoopOrdinal << "/"
+                     << totalMultiBodyLoops << "\n";
+      }
+      multiBodyLoopOrdinal++;
+    }
 
     // Pass 7: Move s_setprio around O rescale v_pk_mul block.
     // Compiler places s_setprio AFTER v_pk_mul; we move it BEFORE.
@@ -2643,7 +2684,7 @@ static std::string postProcessISA(const std::string &isa) {
     // static int g_maxNewVgpr = 0;
     // loop = restructureGEMM2_V3(std::move(loop), label, g_maxNewVgpr);
 
-    if (!disableMaskSkip) {
+    if (allowMaskSkipThisLoop) {
       // --- Pass 10: Scalar branch to skip causal mask for non-boundary blocks ---
       // Generalized: matches ANY SGPR pair (not just s[0:1]), handles up to 2
       // bodies per loop. Two sub-cases:
@@ -2721,6 +2762,14 @@ static std::string postProcessISA(const std::string &isa) {
         }
 
         if (cmpCount < 14 || maxThreshold < 20 || sgprPairs.empty()) {
+          if (debugMaskSkip) {
+            llvm::errs() << "[postProcessISA] mask-skip debug: " << label
+                         << " reject-cmp"
+                         << " cmp=" << cmpCount
+                         << " maxTh=" << maxThreshold
+                         << " sgprs=" << sgprPairs.size()
+                         << " delta=" << maskDeltaReg << "\n";
+          }
           mSearchPos = firstCmpLineEnd + 1; continue;
         }
 
@@ -2866,6 +2915,17 @@ static std::string postProcessISA(const std::string &isa) {
               maskBranchesAdded++;
               mSearchPos = regionEnd + fastCode.size();
               continue;
+            }
+            if (debugMaskSkip) {
+              llvm::errs() << "[postProcessISA] mask-skip debug: " << label
+                           << " reject-scattered"
+                           << " cmp=" << regionCmpCount
+                           << " cnd=" << regionCndCount
+                           << " max3=" << regionMax3Count
+                           << " dspermute=" << seenDsPermute
+                           << " unsafe=" << unsafeBranchUse
+                           << " regionEnd=" << (regionEnd != 0)
+                           << " delta=" << maskDeltaReg << "\n";
             }
           }
 
@@ -3018,9 +3078,26 @@ static std::string postProcessISA(const std::string &isa) {
         size_t firstMax3Pos = loop.find("v_max3_f32", lastCmpLineEnd);
         if (firstMax3Pos == std::string::npos ||
             firstMax3Pos - lastCmpLineEnd > 600) {
+          if (debugMaskSkip) {
+            llvm::errs() << "[postProcessISA] mask-skip debug: " << label
+                         << " reject-max3-gap"
+                         << " cmp=" << cmpCount
+                         << " max3gap="
+                         << ((firstMax3Pos == std::string::npos)
+                                 ? -1
+                                 : static_cast<int>(firstMax3Pos - lastCmpLineEnd))
+                         << " delta=" << maskDeltaReg << "\n";
+          }
           mSearchPos = firstCmpLineEnd + 1; continue;
         }
         if (lastMax3End == 0 || max3Lines.empty()) {
+          if (debugMaskSkip) {
+            llvm::errs() << "[postProcessISA] mask-skip debug: " << label
+                         << " reject-max3-block"
+                         << " cmp=" << cmpCount
+                         << " max3=" << max3Lines.size()
+                         << " delta=" << maskDeltaReg << "\n";
+          }
           mSearchPos = firstCmpLineEnd + 1; continue;
         }
 
@@ -4100,6 +4177,160 @@ static std::string postProcessISA(const std::string &isa) {
     }
   }
 
+  // --- Pass 15e2: Remove the pre-store barrier when both tail permute pairs are
+  // already materialized before it.
+  // Current .LBB0_19 hot-path shape:
+  //   s_waitcnt vmcnt(6)
+  //   v_perm_b32 A0 ...
+  //   v_perm_b32 A1 ...
+  //   s_waitcnt vmcnt(4)
+  //   v_perm_b32 B0 ...
+  //   v_perm_b32 B1 ...
+  //   s_barrier
+  //   s_waitcnt vmcnt(0)
+  //   ds_write_b64 ..., A0/A1
+  //   ds_write_b64 ..., B0/B1
+  //   s_waitcnt lgkmcnt(0)
+  //   s_barrier
+  //   ds_read_b128 ...
+  // Both permute pairs are already complete before the first barrier, and the
+  // final barrier still provides the only LDS-visibility rendezvous for the
+  // following ds_read burst. Drop the pre-store barrier so waves can continue
+  // into the LDS write handoff immediately.
+  {
+    auto trim = [](const std::string &line) -> std::string {
+      size_t start = 0;
+      while (start < line.size() && (line[start] == ' ' || line[start] == '\t'))
+        start++;
+      size_t end = line.size();
+      while (end > start && (line[end - 1] == ' ' || line[end - 1] == '\t'))
+        end--;
+      return line.substr(start, end - start);
+    };
+
+    auto startsWith = [&](const std::string &line, const char *prefix) -> bool {
+      return trim(line).find(prefix) == 0;
+    };
+
+    std::vector<std::string> allLines;
+    {
+      std::istringstream iss(result);
+      std::string line;
+      while (std::getline(iss, line))
+        allLines.push_back(line);
+    }
+
+    bool modified = false;
+    for (size_t i = 0; i + 12 < allLines.size(); i++) {
+      if (trim(allLines[i]) != "s_waitcnt vmcnt(6)")
+        continue;
+      if (!startsWith(allLines[i + 1], "v_perm_b32") ||
+          !startsWith(allLines[i + 2], "v_perm_b32") ||
+          trim(allLines[i + 3]) != "s_waitcnt vmcnt(4)" ||
+          !startsWith(allLines[i + 4], "v_perm_b32") ||
+          !startsWith(allLines[i + 5], "v_perm_b32") ||
+          trim(allLines[i + 6]) != "s_barrier" ||
+          trim(allLines[i + 7]) != "s_waitcnt vmcnt(0)" ||
+          !startsWith(allLines[i + 8], "ds_write_b64") ||
+          !startsWith(allLines[i + 9], "ds_write_b64") ||
+          trim(allLines[i + 10]) != "s_waitcnt lgkmcnt(0)" ||
+          trim(allLines[i + 11]) != "s_barrier" ||
+          !startsWith(allLines[i + 12], "ds_read_b128"))
+        continue;
+
+      allLines.erase(allLines.begin() + i + 6);
+      llvm::errs() << "[postProcessISA] Pass 15e2: Removed pre-store barrier "
+                   << "before tail ds_write handoff at line " << (i + 1)
+                   << "\n";
+      modified = true;
+      i += 11;
+    }
+
+    if (modified) {
+      result.clear();
+      for (size_t j = 0; j < allLines.size(); j++) {
+        result += allLines[j];
+        if (j + 1 < allLines.size())
+          result += "\n";
+      }
+    }
+  }
+
+  // --- Pass 15e3: Move the trailing lgkmcnt(0) behind the split-loop handoff
+  // barrier once both LDS write pairs have already been issued.
+  // Current hot-path shape:
+  //   s_waitcnt vmcnt(6)
+  //   v_perm_b32 A0 ...
+  //   v_perm_b32 B0 ...
+  //   s_waitcnt vmcnt(4)
+  //   v_perm_b32 A1 ...
+  //   v_perm_b32 B1 ...
+  //   s_waitcnt vmcnt(0)
+  //   ds_write_b64 ..., A0/A1
+  //   ds_write_b64 ..., B0/B1
+  //   s_waitcnt lgkmcnt(0)
+  //   s_barrier
+  //   ds_read_b128 ...
+  // The barrier is the cross-wave rendezvous point; the lgkmcnt wait only guards
+  // the following LDS read burst. Swapping them lets waves reach the barrier
+  // sooner without changing the eventual per-wave LDS readiness check.
+  {
+    auto trim = [](const std::string &line) -> std::string {
+      size_t start = 0;
+      while (start < line.size() && (line[start] == ' ' || line[start] == '\t'))
+        start++;
+      size_t end = line.size();
+      while (end > start && (line[end - 1] == ' ' || line[end - 1] == '\t'))
+        end--;
+      return line.substr(start, end - start);
+    };
+
+    auto startsWith = [&](const std::string &line, const char *prefix) -> bool {
+      return trim(line).find(prefix) == 0;
+    };
+
+    std::vector<std::string> allLines;
+    {
+      std::istringstream iss(result);
+      std::string line;
+      while (std::getline(iss, line))
+        allLines.push_back(line);
+    }
+
+    bool modified = false;
+    for (size_t i = 0; i + 11 < allLines.size(); i++) {
+      if (trim(allLines[i]) != "s_waitcnt vmcnt(6)")
+        continue;
+      if (!startsWith(allLines[i + 1], "v_perm_b32") ||
+          !startsWith(allLines[i + 2], "v_perm_b32") ||
+          trim(allLines[i + 3]) != "s_waitcnt vmcnt(4)" ||
+          !startsWith(allLines[i + 4], "v_perm_b32") ||
+          !startsWith(allLines[i + 5], "v_perm_b32") ||
+          trim(allLines[i + 6]) != "s_waitcnt vmcnt(0)" ||
+          !startsWith(allLines[i + 7], "ds_write_b64") ||
+          !startsWith(allLines[i + 8], "ds_write_b64") ||
+          trim(allLines[i + 9]) != "s_waitcnt lgkmcnt(0)" ||
+          trim(allLines[i + 10]) != "s_barrier" ||
+          !startsWith(allLines[i + 11], "ds_read_b128"))
+        continue;
+
+      std::swap(allLines[i + 9], allLines[i + 10]);
+      llvm::errs() << "[postProcessISA] Pass 15e3: Moved split-loop lgkmcnt "
+                   << "behind barrier at line " << (i + 1) << "\n";
+      modified = true;
+      i += 10;
+    }
+
+    if (modified) {
+      result.clear();
+      for (size_t j = 0; j < allLines.size(); j++) {
+        result += allLines[j];
+        if (j + 1 < allLines.size())
+          result += "\n";
+      }
+    }
+  }
+
   // --- Pass 15f: Pull the first pre-exp LDS write ahead of the final vmcnt(0)
   // in the prefixed pre-18852 handoff.
   // Hot-path shape:
@@ -4461,6 +4692,155 @@ static std::string postProcessISA(const std::string &isa) {
                    << (i + 1) << "\n";
       modified = true;
       i += 7;
+    }
+
+    if (modified) {
+      result.clear();
+      for (size_t j = 0; j < allLines.size(); j++) {
+        result += allLines[j];
+        if (j + 1 < allLines.size())
+          result += "\n";
+      }
+    }
+  }
+
+  // --- Pass 15j2: Delay the pre-exp lgkmcnt(0) until just before the first
+  // ds_read burst in the common split-loop handoff.
+  // Current hot-path shape:
+  //   ds_write_b64 ...
+  //   ds_write_b64 ...
+  //   s_waitcnt lgkmcnt(0)
+  //   s_barrier
+  //   ;;#ASMSTART
+  //   s_setprio 1
+  //   ;;#ASMEND
+  //   v_mul_f32_e32 ...
+  //   ds_read_b128 ...
+  // The barrier is the cross-wave rendezvous. The lgkm wait only guards the
+  // following per-wave ds_read, so move it below the barrier handoff and the
+  // common v_mul setup.
+  {
+    auto trim = [](const std::string &line) -> std::string {
+      size_t start = 0;
+      while (start < line.size() && (line[start] == ' ' || line[start] == '\t'))
+        start++;
+      size_t end = line.size();
+      while (end > start && (line[end - 1] == ' ' || line[end - 1] == '\t'))
+        end--;
+      return line.substr(start, end - start);
+    };
+
+    auto startsWith = [&](const std::string &line, const char *prefix) -> bool {
+      return trim(line).find(prefix) == 0;
+    };
+
+    std::vector<std::string> allLines;
+    {
+      std::istringstream iss(result);
+      std::string line;
+      while (std::getline(iss, line))
+        allLines.push_back(line);
+    }
+
+    bool modified = false;
+    for (size_t i = 0; i + 8 < allLines.size(); i++) {
+      if (!startsWith(allLines[i], "ds_write_b64") ||
+          !startsWith(allLines[i + 1], "ds_write_b64") ||
+          trim(allLines[i + 2]) != "s_waitcnt lgkmcnt(0)" ||
+          trim(allLines[i + 3]) != "s_barrier" ||
+          trim(allLines[i + 4]) != ";;#ASMSTART" ||
+          trim(allLines[i + 5]) != "s_setprio 1" ||
+          trim(allLines[i + 6]) != ";;#ASMEND" ||
+          !startsWith(allLines[i + 7], "v_mul_f32_e32") ||
+          !startsWith(allLines[i + 8], "ds_read_b128"))
+        continue;
+
+      std::string wait = allLines[i + 2];
+      allLines.erase(allLines.begin() + i + 2);
+      allLines.insert(allLines.begin() + i + 7, wait);
+      llvm::errs() << "[postProcessISA] Pass 15j2: Delayed split-loop pre-exp "
+                   << "lgkmcnt wait behind barrier at line " << (i + 1)
+                   << "\n";
+      modified = true;
+      i += 8;
+    }
+
+    if (modified) {
+      result.clear();
+      for (size_t j = 0; j < allLines.size(); j++) {
+        result += allLines[j];
+        if (j + 1 < allLines.size())
+          result += "\n";
+      }
+    }
+  }
+
+  // --- Pass 15j3: Delay the staggered pre-exp lgkmcnt(0) until just before the
+  // first ds_read burst when the second ds_write lands after a vmcnt(0)+perm
+  // pair.
+  // Current hot-path shape:
+  //   ds_write_b64 ...
+  //   s_waitcnt vmcnt(0)
+  //   v_perm_b32 ...
+  //   v_perm_b32 ...
+  //   ds_write_b64 ...
+  //   s_waitcnt lgkmcnt(0)
+  //   s_barrier
+  //   ;;#ASMSTART
+  //   s_setprio 1
+  //   ;;#ASMEND
+  //   v_mul_f32_e32 ...
+  //   ds_read_b128 ...
+  // Both ds_write instructions have already issued before the barrier. The
+  // remaining lgkm wait only guards the following per-wave ds_read burst, so
+  // move it below the barrier handoff and common v_mul setup.
+  {
+    auto trim = [](const std::string &line) -> std::string {
+      size_t start = 0;
+      while (start < line.size() && (line[start] == ' ' || line[start] == '\t'))
+        start++;
+      size_t end = line.size();
+      while (end > start && (line[end - 1] == ' ' || line[end - 1] == '\t'))
+        end--;
+      return line.substr(start, end - start);
+    };
+
+    auto startsWith = [&](const std::string &line, const char *prefix) -> bool {
+      return trim(line).find(prefix) == 0;
+    };
+
+    std::vector<std::string> allLines;
+    {
+      std::istringstream iss(result);
+      std::string line;
+      while (std::getline(iss, line))
+        allLines.push_back(line);
+    }
+
+    bool modified = false;
+    for (size_t i = 0; i + 11 < allLines.size(); i++) {
+      if (!startsWith(allLines[i], "ds_write_b64") ||
+          trim(allLines[i + 1]) != "s_waitcnt vmcnt(0)" ||
+          !startsWith(allLines[i + 2], "v_perm_b32") ||
+          !startsWith(allLines[i + 3], "v_perm_b32") ||
+          !startsWith(allLines[i + 4], "ds_write_b64") ||
+          trim(allLines[i + 5]) != "s_waitcnt lgkmcnt(0)" ||
+          trim(allLines[i + 6]) != "s_barrier" ||
+          trim(allLines[i + 7]) != ";;#ASMSTART" ||
+          trim(allLines[i + 8]) != "s_setprio 1" ||
+          trim(allLines[i + 9]) != ";;#ASMEND" ||
+          !startsWith(allLines[i + 10], "v_mul_f32_e32") ||
+          !startsWith(allLines[i + 11], "ds_read_b128"))
+        continue;
+
+      std::string wait = allLines[i + 5];
+      allLines.erase(allLines.begin() + i + 5);
+      allLines.insert(allLines.begin() + i + 10, wait);
+      llvm::errs() << "[postProcessISA] Pass 15j3: Delayed staggered pre-exp "
+                   << "lgkmcnt wait behind barrier at line " << (i + 1)
+                   << "\n";
+      modified = true;
+      i += 11;
     }
 
     if (modified) {
@@ -5109,7 +5489,8 @@ static std::string postProcessISA(const std::string &isa) {
   //       s_setprio 0 / s_setprio 1 / s_nop 0
   //     into
   //       s_setprio 0 / s_nop N / s_setprio 1
-  //     where N defaults to 0 (the current winner).
+  //     where N defaults to 0. Match both the legacy
+  //     vmcnt(2) loop-top prelude and the split-loop vmcnt(6) variant.
   //
   //   FLIR_PASS26_POSTMFMA_NOP
   //     Inserts a new ASMSTART/s_nop N/ASMEND block after repeated
@@ -5141,6 +5522,10 @@ static std::string postProcessISA(const std::string &isa) {
     };
     auto makeAsmBlock = [](const std::string &inst) -> std::vector<std::string> {
       return {"\t;;#ASMSTART", "\t" + inst, "\t;;#ASMEND"};
+    };
+    auto isLoopTopWait = [&](const std::string &line) -> bool {
+      std::string t = trim(line);
+      return t == "s_waitcnt vmcnt(2)" || t == "s_waitcnt vmcnt(6)";
     };
 
     const bool disablePass26 = []() {
@@ -5177,7 +5562,7 @@ static std::string postProcessISA(const std::string &isa) {
             trim(allLines[i + 6]) != ";;#ASMSTART" ||
             trim(allLines[i + 7]) != "s_nop 0" ||
             trim(allLines[i + 8]) != ";;#ASMEND" ||
-            trim(allLines[i + 9]) != "s_waitcnt vmcnt(2)" ||
+            !isLoopTopWait(allLines[i + 9]) ||
             trim(allLines[i + 10]).find("v_perm_b32") != 0)
           continue;
 
