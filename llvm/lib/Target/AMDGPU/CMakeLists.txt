@@ -155,7 +155,9 @@ add_llvm_target(AMDGPUCodeGen
   R600TargetMachine.cpp
   R600TargetTransformInfo.cpp
   SIAnnotateControlFlow.cpp
+  SIFixDsReadPlacement.cpp
   SIFixSGPRCopies.cpp
+  SIFixSetprioPlacement.cpp
   SIFixVGPRCopies.cpp
   SIFoldOperands.cpp
   SIFormMemoryClauses.cpp

@@ -554,6 +554,12 @@ extern char &GCNPreRAOptimizationsID;
 FunctionPass *createAMDGPUSetWavePriorityPass();
 void initializeAMDGPUSetWavePriorityLegacyPass(PassRegistry &);
 
+FunctionPass *createSIFixSetprioPlacementPass();
+void initializeSIFixSetprioPlacementPass(PassRegistry &);
+
+FunctionPass *createSIFixDsReadPlacementPass();
+void initializeSIFixDsReadPlacementPass(PassRegistry &);
+
 void initializeGCNRewritePartialRegUsesLegacyPass(llvm::PassRegistry &);
 extern char &GCNRewritePartialRegUsesID;
 

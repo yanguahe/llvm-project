@@ -1349,12 +1349,26 @@ bool WaitcntGeneratorPreGFX12::applyPreexistingWaitcnt(
   MachineInstr *WaitcntInstr = nullptr;
   MachineInstr *WaitcntVsCntInstr = nullptr;
 
+  // TrustBarrierWaitcnt: if the waitcnt is preceded by SCHED_BARRIER,
+  // preserve user-specified values instead of tightening them.
+  bool TrustBarrierWaitcnt = false;
+  {
+    auto CheckIt = OldWaitcntInstr.getIterator();
+    if (CheckIt != OldWaitcntInstr.getParent()->instr_begin()) {
+      --CheckIt;
+      if (CheckIt->getOpcode() == AMDGPU::SCHED_BARRIER)
+        TrustBarrierWaitcnt = true;
+    }
+  }
+
   LLVM_DEBUG({
     dbgs() << "PreGFX12::applyPreexistingWaitcnt at: ";
     if (It == OldWaitcntInstr.getParent()->instr_end())
       dbgs() << "end of block\n";
     else
       dbgs() << *It;
+    if (TrustBarrierWaitcnt)
+      dbgs() << "  (TrustBarrierWaitcnt: preserving user waitcnt)\n";
   });
 
   for (auto &II :
@@ -1373,9 +1387,13 @@ bool WaitcntGeneratorPreGFX12::applyPreexistingWaitcnt(
     if (Opcode == AMDGPU::S_WAITCNT) {
       unsigned IEnc = II.getOperand(0).getImm();
       AMDGPU::Waitcnt OldWait = AMDGPU::decodeWaitcnt(IV, IEnc);
-      if (TrySimplify)
-        ScoreBrackets.simplifyWaitcnt(OldWait);
-      Wait = Wait.combined(OldWait);
+      if (TrustBarrierWaitcnt) {
+        Wait = OldWait;
+      } else {
+        if (TrySimplify)
+          ScoreBrackets.simplifyWaitcnt(OldWait);
+        Wait = Wait.combined(OldWait);
+      }
 
       // Merge consecutive waitcnt of the same type by erasing multiples.
       if (WaitcntInstr || (!Wait.hasWaitExceptStoreCnt() && TrySimplify)) {

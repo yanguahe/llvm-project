@@ -91,7 +91,7 @@ public:
   // An error margin is necessary because of poor performance of the generic RP
   // tracker and can be adjusted up for tuning heuristics to try and more
   // aggressively reduce register pressure.
-  unsigned ErrorMargin = 3;
+  unsigned ErrorMargin = 0;
 
   // Bias for SGPR limits under a high register pressure.
   const unsigned HighRPSGPRBias = 7;
