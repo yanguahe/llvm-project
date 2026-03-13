@@ -5369,6 +5369,62 @@ static std::string postProcessISA(const std::string &isa) {
     }
   }
 
+  // --- Pass 15z: Keep the post-ds_permute rowmax/rescale VALU tail contiguous
+  // by sinking the single interleaved MFMA below the pk_fma burst and the
+  // following exp. On MI308X, MFMA and VALU serialize, so breaking the VALU
+  // chain mid-tail can be more expensive than launching that MFMA a few slots
+  // later.
+  {
+    std::vector<std::string> allLines = splitIsaLines(result);
+    bool modified = false;
+    for (size_t i = 0; i + 17 < allLines.size(); i++) {
+      if (trimIsaLine(allLines[i]) != "s_waitcnt lgkmcnt(0)" ||
+          trimIsaLine(allLines[i + 1]) != "v_max_f32_e32 v116, v116, v118" ||
+          trimIsaLine(allLines[i + 2]) != "v_sub_f32_e32 v118, v192, v116" ||
+          trimIsaLine(allLines[i + 3]).find(
+              "v_mfma_f32_32x32x8_bf16 v[48:63], v[152:153], v[124:125], "
+              "v[48:63]") != 0 ||
+          trimIsaLine(allLines[i + 4]) !=
+              "v_mul_f32_e32 v119, 0x3e0293ee, v116" ||
+          trimIsaLine(allLines[i + 5]) !=
+              "v_max_f32_e32 v151, 0xff800000, v118" ||
+          trimIsaLine(allLines[i + 6]) !=
+              "v_min_f32_e64 v118, -v119, s12" ||
+          trimIsaLine(allLines[i + 7]) !=
+              "v_mul_f32_e32 v151, 0x3e0293ee, v151" ||
+          trimIsaLine(allLines[i + 8]).find("v_pk_fma_f32 v[78:79]") != 0 ||
+          trimIsaLine(allLines[i + 9]).find("v_pk_fma_f32 v[76:77]") != 0 ||
+          trimIsaLine(allLines[i + 10]).find("v_pk_fma_f32 v[74:75]") != 0 ||
+          trimIsaLine(allLines[i + 11]).find(
+              "v_mfma_f32_32x32x8_bf16 v[32:47], v[158:159], v[124:125], "
+              "v[32:47]") != 0 ||
+          trimIsaLine(allLines[i + 12]).find("v_pk_fma_f32 v[72:73]") != 0 ||
+          trimIsaLine(allLines[i + 13]).find("v_pk_fma_f32 v[70:71]") != 0 ||
+          trimIsaLine(allLines[i + 14]).find("v_pk_fma_f32 v[68:69]") != 0 ||
+          trimIsaLine(allLines[i + 15]).find("v_pk_fma_f32 v[66:67]") != 0 ||
+          trimIsaLine(allLines[i + 16]).find("v_pk_fma_f32 v[118:119]") != 0 ||
+          trimIsaLine(allLines[i + 17]) != "v_exp_f32_e32 v64, v151")
+        continue;
+
+      std::string moved = allLines[i + 11];
+      allLines.erase(allLines.begin() + i + 11);
+      allLines.insert(allLines.begin() + i + 17, moved);
+      llvm::errs() << "[postProcessISA] Pass 15z: Sank interleaved MFMA below "
+                   << "the rowmax/rescale tail at line " << (i + 1) << "\n";
+      modified = true;
+      i += 17;
+    }
+
+    if (modified) {
+      result.clear();
+      for (size_t j = 0; j < allLines.size(); j++) {
+        result += allLines[j];
+        if (j + 1 < allLines.size())
+          result += "\n";
+      }
+    }
+  }
+
   // --- Pass 16: GEMM2 V-read defragmentation ---
   // DISABLED: Pre-loading all 16 V reads causes regression (114.7T → 109.9T).
   // Root cause: causal mask code between first and second MFMA still fragments
