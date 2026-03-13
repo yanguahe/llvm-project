@@ -5156,6 +5156,91 @@ static std::string postProcessISA(const std::string &isa) {
     }
   }
 
+  // --- Pass 15o: Relax the split-prefix post-exp GEMM2 waits to only wait for
+  // the first LDS-backed V pair that the next MFMA actually consumes.
+  // Current hot-prefix shape in the final ISA:
+  //   s_mov_b32 m0, s3
+  //   s_waitcnt lgkmcnt(0)
+  //   v_mfma ... v[48:63], v[148:149], ...
+  //   ds_read_b64 v[148:149], ... offset:17536
+  //   ds_read_b64 v[156:157], ... offset:18560
+  //   ds_read_b64 v[158:159], ... offset:19584
+  //   ds_read_b64 v[160:161], ... offset:20608
+  //   s_waitcnt lgkmcnt(0)
+  //   v_mfma ... v[32:47], v[148:149], ...
+  //   ds_read_b64 v[148:149], ... offset:17664
+  //   ds_read_b64 v[162:163], ... offset:18688
+  //   ds_read_b64 v[164:165], ... offset:19712
+  //   ds_read_b64 v[166:167], ... offset:20736
+  //   s_waitcnt lgkmcnt(0)
+  //   v_mfma ... v[16:31], v[148:149], ...
+  // The next MFMA after each wait only consumes the first reloaded pair
+  // v[148:149]. The later three ds_read_b64 ops feed later MFMAs, so keeping
+  // three lgkm operations outstanding lets them overlap with the current MFMA
+  // window instead of draining them all up front.
+  {
+    auto trim = [](const std::string &line) -> std::string {
+      size_t start = 0;
+      while (start < line.size() && (line[start] == ' ' || line[start] == '\t'))
+        start++;
+      size_t end = line.size();
+      while (end > start && (line[end - 1] == ' ' || line[end - 1] == '\t'))
+        end--;
+      return line.substr(start, end - start);
+    };
+
+    std::vector<std::string> allLines;
+    {
+      std::istringstream iss(result);
+      std::string line;
+      while (std::getline(iss, line))
+        allLines.push_back(line);
+    }
+
+    bool modified = false;
+    for (size_t i = 0; i + 14 < allLines.size(); i++) {
+      if (trim(allLines[i]) != "s_mov_b32 m0, s3" ||
+          trim(allLines[i + 1]) != "s_waitcnt lgkmcnt(0)" ||
+          trim(allLines[i + 2]).find(
+              "v_mfma_f32_32x32x8_bf16 v[48:63], v[148:149], v[184:185], "
+              "v[48:63]") != 0 ||
+          trim(allLines[i + 3]) != "ds_read_b64 v[148:149], v135 offset:17536" ||
+          trim(allLines[i + 4]) != "ds_read_b64 v[156:157], v135 offset:18560" ||
+          trim(allLines[i + 5]) != "ds_read_b64 v[158:159], v135 offset:19584" ||
+          trim(allLines[i + 6]) != "ds_read_b64 v[160:161], v135 offset:20608" ||
+          trim(allLines[i + 7]) != "s_waitcnt lgkmcnt(0)" ||
+          trim(allLines[i + 8]).find(
+              "v_mfma_f32_32x32x8_bf16 v[32:47], v[148:149], v[184:185], "
+              "v[32:47]") != 0 ||
+          trim(allLines[i + 9]) != "ds_read_b64 v[148:149], v135 offset:17664" ||
+          trim(allLines[i + 10]) != "ds_read_b64 v[162:163], v135 offset:18688" ||
+          trim(allLines[i + 11]) != "ds_read_b64 v[164:165], v135 offset:19712" ||
+          trim(allLines[i + 12]) != "ds_read_b64 v[166:167], v135 offset:20736" ||
+          trim(allLines[i + 13]) != "s_waitcnt lgkmcnt(0)" ||
+          trim(allLines[i + 14]).find(
+              "v_mfma_f32_32x32x8_bf16 v[16:31], v[148:149], v[184:185], "
+              "v[16:31]") != 0)
+        continue;
+
+      allLines[i + 1] = "\ts_waitcnt lgkmcnt(3)";
+      allLines[i + 7] = "\ts_waitcnt lgkmcnt(3)";
+      allLines[i + 13] = "\ts_waitcnt lgkmcnt(3)";
+      llvm::errs() << "[postProcessISA] Pass 15o: Relaxed split-prefix GEMM2 "
+                   << "wait trio to lgkmcnt(3) at line " << (i + 1) << "\n";
+      modified = true;
+      i += 14;
+    }
+
+    if (modified) {
+      result.clear();
+      for (size_t j = 0; j < allLines.size(); j++) {
+        result += allLines[j];
+        if (j + 1 < allLines.size())
+          result += "\n";
+      }
+    }
+  }
+
   // --- Pass 16: GEMM2 V-read defragmentation ---
   // DISABLED: Pre-loading all 16 V reads causes regression (114.7T → 109.9T).
   // Root cause: causal mask code between first and second MFMA still fragments
