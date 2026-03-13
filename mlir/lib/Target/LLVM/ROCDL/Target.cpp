@@ -5425,6 +5425,63 @@ static std::string postProcessISA(const std::string &isa) {
     }
   }
 
+  // --- Pass 15an: In the hottest late rowmax/MFMA handoff window, hoist the
+  // independent v48 MFMA ahead of the lgkmcnt(0) that currently gates the hot
+  // v16 MFMA consuming v118:119. This keeps producer order intact while adding
+  // one real MFMA-sized issue gap before the 0x68ac consumer.
+  {
+    std::vector<std::string> allLines = splitIsaLines(result);
+    bool modified = false;
+    for (size_t i = 0; i + 12 < allLines.size(); i++) {
+      if (trimIsaLine(allLines[i]) !=
+              "ds_read_b64 v[160:161], v135 offset:27392" ||
+          trimIsaLine(allLines[i + 1]) !=
+              "ds_read_b64 v[162:163], v135 offset:28416" ||
+          trimIsaLine(allLines[i + 2]) !=
+              "ds_read_b64 v[164:165], v135 offset:29440" ||
+          trimIsaLine(allLines[i + 3]).find(
+              "v_max3_f32 v116, v116, v74, v75") != 0 ||
+          trimIsaLine(allLines[i + 4]).find(
+              "v_max3_f32 v116, v116, v76, v77") != 0 ||
+          trimIsaLine(allLines[i + 5]).find(
+              "v_max3_f32 v116, v116, v78, v79") != 0 ||
+          trimIsaLine(allLines[i + 6]) != "s_waitcnt lgkmcnt(0)" ||
+          trimIsaLine(allLines[i + 7]).find(
+              "v_mfma_f32_32x32x8_bf16 v[16:31], v[118:119], v[186:187], "
+              "v[16:31]") != 0 ||
+          trimIsaLine(allLines[i + 8]) !=
+              "ds_read_b64 v[118:119], v135 offset:26496" ||
+          trimIsaLine(allLines[i + 9]) != "s_waitcnt lgkmcnt(0)" ||
+          trimIsaLine(allLines[i + 10]).find(
+              "v_mfma_f32_32x32x8_bf16 v[0:15], v[118:119], v[186:187], "
+              "v[0:15]") != 0 ||
+          trimIsaLine(allLines[i + 11]) !=
+              "ds_read_b64 v[118:119], v135 offset:27520" ||
+          trimIsaLine(allLines[i + 12]).find(
+              "v_mfma_f32_32x32x8_bf16 v[48:63], v[148:149], v[188:189], "
+              "v[48:63]") != 0)
+        continue;
+
+      std::string moved = allLines[i + 12];
+      allLines.erase(allLines.begin() + i + 12);
+      allLines.insert(allLines.begin() + i + 6, moved);
+      llvm::errs() << "[postProcessISA] Pass 15an: Hoisted late-window v48 "
+                   << "MFMA ahead of the hot v16 wait at line " << (i + 1)
+                   << "\n";
+      modified = true;
+      i += 12;
+    }
+
+    if (modified) {
+      result.clear();
+      for (size_t j = 0; j < allLines.size(); j++) {
+        result += allLines[j];
+        if (j + 1 < allLines.size())
+          result += "\n";
+      }
+    }
+  }
+
   // --- Pass 16: GEMM2 V-read defragmentation ---
   // DISABLED: Pre-loading all 16 V reads causes regression (114.7T → 109.9T).
   // Root cause: causal mask code between first and second MFMA still fragments
