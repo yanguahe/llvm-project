@@ -5146,6 +5146,62 @@ static std::string postProcessISA(const std::string &isa) {
       i += 21;
     }
 
+    // --- Pass 15q: Remove the early common-path lgkm wait when the next MFMA
+    // and ds_permute do not consume the newly issued LDS-backed V staging loads.
+    // Current hot-path shape:
+    //   buffer_load_dword v138, ... lds
+    //   s_mov_b32 m0, s67
+    //   v_cmp_lt_i64_e32 ...
+    //   buffer_load_dword v140, ... lds
+    //   s_mov_b32 m0, s74
+    //   v_mfma_f32_32x32x8_bf16 v[50:65], ...
+    //   buffer_load_dword v142, ... lds
+    //   s_mov_b32 m0, s75
+    //   s_add_i32 s13, s13, s12
+    //   buffer_load_dword v144, ... lds
+    //   v_mfma_f32_32x32x8_bf16 v[34:49], ...
+    //   v_mfma_f32_32x32x8_bf16 v[18:33], ...
+    //   s_waitcnt lgkmcnt(0)
+    //   v_mfma_f32_32x32x8_bf16 v[2:17], ...
+    //   ds_permute_b32 ...
+    //   s_waitcnt lgkmcnt(0)
+    // The earlier wait drains the LDS-backed staging loads before an independent
+    // MFMA+permute pair. Let the later wait after ds_permute collect them instead.
+    for (size_t i = 0; i + 15 < allLines.size(); i++) {
+      if (trim(allLines[i]).find("buffer_load_dword v138, s[48:51], s17 offen lds") != 0 ||
+          trim(allLines[i + 1]) != "s_mov_b32 m0, s67" ||
+          trim(allLines[i + 2]).find("v_cmp_lt_i64_e32 vcc, s[4:5], v[128:129]") != 0 ||
+          trim(allLines[i + 3]).find("buffer_load_dword v140, s[48:51], s17 offen lds") != 0 ||
+          trim(allLines[i + 4]) != "s_mov_b32 m0, s74" ||
+          trim(allLines[i + 5]).find(
+              "v_mfma_f32_32x32x8_bf16 v[50:65], v[196:197], v[236:237], "
+              "v[50:65]") != 0 ||
+          trim(allLines[i + 6]).find("buffer_load_dword v142, s[48:51], s17 offen lds") != 0 ||
+          trim(allLines[i + 7]) != "s_mov_b32 m0, s75" ||
+          trim(allLines[i + 8]) != "s_add_i32 s13, s13, s12" ||
+          trim(allLines[i + 9]).find("buffer_load_dword v144, s[48:51], s17 offen lds") != 0 ||
+          trim(allLines[i + 10]).find(
+              "v_mfma_f32_32x32x8_bf16 v[34:49], v[204:205], v[236:237], "
+              "v[34:49]") != 0 ||
+          trim(allLines[i + 11]).find(
+              "v_mfma_f32_32x32x8_bf16 v[18:33], v[208:209], v[236:237], "
+              "v[18:33]") != 0 ||
+          trim(allLines[i + 12]) != "s_waitcnt lgkmcnt(0)" ||
+          trim(allLines[i + 13]).find(
+              "v_mfma_f32_32x32x8_bf16 v[2:17], v[124:125], v[236:237], "
+              "v[2:17]") != 0 ||
+          trim(allLines[i + 14]).find("ds_permute_b32 v124, v134, v122") != 0 ||
+          trim(allLines[i + 15]) != "s_waitcnt lgkmcnt(0)")
+        continue;
+
+      allLines.erase(allLines.begin() + i + 12);
+      llvm::errs() << "[postProcessISA] Pass 15q: Delayed common-path lgkm wait "
+                   << "behind independent MFMA+permute at line " << (i + 1)
+                   << "\n";
+      modified = true;
+      i += 14;
+    }
+
     if (modified) {
       result.clear();
       for (size_t j = 0; j < allLines.size(); j++) {
