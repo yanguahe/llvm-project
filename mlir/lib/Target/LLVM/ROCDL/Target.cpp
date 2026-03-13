@@ -5297,6 +5297,78 @@ static std::string postProcessISA(const std::string &isa) {
     }
   }
 
+  // --- Pass 15v: Issue the first split-prefix raw-V producer pair earlier in
+  // the hottest prefix-free handoff window so the later vmcnt(6) wait has more
+  // time to age those two loads before the first v_perm pair consumes them.
+  // Current final-ISA shape:
+  //   s_waitcnt lgkmcnt(0)
+  //   v_mfma ... v[0:15], v[148:149], v[184:185], ...
+  //   ds_read_b64 v[148:149], ... offset:18816
+  //   v_mfma ... v[48:63], v[150:151], v[186:187], ...
+  //   s_waitcnt lgkmcnt(0)
+  //   v_mfma ... v[0:15], v[148:149], v[186:187], ...
+  //   ds_read_b64 v[148:149], ... offset:19840
+  //   ds_read_b64 v[150:151], ... offset:20864
+  //   buffer_load_dword v119, ...
+  //   buffer_load_dword v125, ...
+  //   v_mfma ... v[48:63], v[152:153], v[126:127], ...
+  // The first post-pk_mul vmcnt(6) only needs v119/v125, so issue that pair
+  // immediately after the earlier lgkmcnt(0) instead of after the later
+  // ds_read pair. This preserves register usage and the later v152/v153 reloads.
+  {
+    std::vector<std::string> allLines = splitIsaLines(result);
+    bool modified = false;
+    for (size_t i = 0; i + 12 < allLines.size(); i++) {
+      if (trimIsaLine(allLines[i]) != "s_waitcnt lgkmcnt(0)" ||
+          trimIsaLine(allLines[i + 1]).find(
+              "v_mfma_f32_32x32x8_bf16 v[0:15], v[148:149], v[184:185], "
+              "v[0:15]") != 0 ||
+          trimIsaLine(allLines[i + 2]) !=
+              "ds_read_b64 v[148:149], v135 offset:18816" ||
+          trimIsaLine(allLines[i + 3]).find(
+              "v_mfma_f32_32x32x8_bf16 v[48:63], v[150:151], v[186:187], "
+              "v[48:63]") != 0 ||
+          trimIsaLine(allLines[i + 4]) != "s_waitcnt lgkmcnt(0)" ||
+          trimIsaLine(allLines[i + 5]).find(
+              "v_mfma_f32_32x32x8_bf16 v[0:15], v[148:149], v[186:187], "
+              "v[0:15]") != 0 ||
+          trimIsaLine(allLines[i + 6]) !=
+              "ds_read_b64 v[148:149], v135 offset:19840" ||
+          trimIsaLine(allLines[i + 7]) !=
+              "ds_read_b64 v[150:151], v135 offset:20864" ||
+          trimIsaLine(allLines[i + 8]).find(
+              "buffer_load_dword v119, v139, s[44:47], s9 offen") != 0 ||
+          trimIsaLine(allLines[i + 9]).find(
+              "buffer_load_dword v125, v141, s[44:47], s9 offen") != 0 ||
+          trimIsaLine(allLines[i + 10]).find(
+              "v_mfma_f32_32x32x8_bf16 v[48:63], v[152:153], v[126:127], "
+              "v[48:63]") != 0 ||
+          trimIsaLine(allLines[i + 11]).find(
+              "buffer_load_dword v152, v143, s[44:47], s9 offen") != 0 ||
+          trimIsaLine(allLines[i + 12]).find(
+              "buffer_load_dword v153, v145, s[44:47], s9 offen") != 0)
+        continue;
+
+      std::vector<std::string> moved = {allLines[i + 8], allLines[i + 9]};
+      allLines.erase(allLines.begin() + i + 8, allLines.begin() + i + 10);
+      allLines.insert(allLines.begin() + i + 1, moved.begin(), moved.end());
+      llvm::errs() << "[postProcessISA] Pass 15v: Hoisted first split-prefix "
+                   << "raw V pair ahead of the later ds_read pair at line "
+                   << (i + 1) << "\n";
+      modified = true;
+      i += 12;
+    }
+
+    if (modified) {
+      result.clear();
+      for (size_t j = 0; j < allLines.size(); j++) {
+        result += allLines[j];
+        if (j + 1 < allLines.size())
+          result += "\n";
+      }
+    }
+  }
+
   // --- Pass 16: GEMM2 V-read defragmentation ---
   // DISABLED: Pre-loading all 16 V reads causes regression (114.7T → 109.9T).
   // Root cause: causal mask code between first and second MFMA still fragments
