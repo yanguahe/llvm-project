@@ -4258,6 +4258,8 @@ static std::string postProcessISA(const std::string &isa) {
 
   // --- Pass 15e3: Move the trailing lgkmcnt(0) behind the split-loop handoff
   // barrier once both LDS write pairs have already been issued.
+  // This split-loop handoff remains the 122T large-sequence baseline hot path when
+  // the frontend takes prefix/tail split by default.
   // Current hot-path shape:
   //   s_waitcnt vmcnt(6)
   //   v_perm_b32 A0 ...
