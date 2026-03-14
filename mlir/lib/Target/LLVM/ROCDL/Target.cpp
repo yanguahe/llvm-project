@@ -442,6 +442,33 @@ FailureOr<SmallVector<char, 0>> SerializeGPUModuleBase::moduleToObjectImpl(
     return getOperation().emitError()
            << "invalid ROCm path, please set a valid path";
 
+  // Post-process ISA if FLYDSL_POSTPROCESS_ISA is set to a script path.
+  if (const char *ppScript = std::getenv("FLYDSL_POSTPROCESS_ISA")) {
+    // Write ISA to temp file, run script, read back.
+    llvm::SmallString<128> inputPath, outputPath;
+    llvm::sys::fs::createTemporaryFile("isa_input", "s", inputPath);
+    llvm::sys::fs::createTemporaryFile("isa_output", "s", outputPath);
+    {
+      std::error_code ec;
+      llvm::raw_fd_ostream os(inputPath, ec);
+      if (!ec)
+        os << *serializedISA;
+    }
+    std::string cmd = std::string(ppScript) + " " + inputPath.c_str() + " " +
+                      outputPath.c_str();
+    int ret = std::system(cmd.c_str());
+    if (ret == 0) {
+      auto buf = llvm::MemoryBuffer::getFile(outputPath);
+      if (buf) {
+        serializedISA->clear();
+        serializedISA->append((*buf)->getBufferStart(),
+                              (*buf)->getBufferEnd());
+      }
+    }
+    llvm::sys::fs::remove(inputPath);
+    llvm::sys::fs::remove(outputPath);
+  }
+
   // Compile to binary.
   return compileToBinary(*serializedISA);
 }
