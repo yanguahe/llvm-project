@@ -8,9 +8,10 @@
 //
 // This pass optimizes FMHA-style GEMM loops by:
 //   T1: Hoisting V global_loads before the first s_barrier
-//   T2: Converting serial ds_read/MFMA chains to double-buffered
+//   T2: Converting serial ds_read/MFMA chains to double-buffered (GEMM1)
 //   T3: Interleaving V ds_writes into GEMM1 MFMA slots
-//   T4: (implicit) Original V sections removed via instruction movement
+//   T4: Double-buffering GEMM2 ds_read/MFMA chains (V^T reads)
+//   T5: Defer V global loads past Barrier1 to overlap with GEMM1
 //
 // Runs before SIInsertWaitcnts so waitcnt values are auto-generated.
 //
@@ -23,6 +24,7 @@
 #include "SIRegisterInfo.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/Support/CommandLine.h"
+#include <fstream>
 
 using namespace llvm;
 
@@ -73,8 +75,30 @@ class SIGEMMScheduleOptimize {
            Opc == AMDGPU::GLOBAL_LOAD_DWORDX4_SADDR;
   }
 
+  static bool isBufferLoadLDS(const MachineInstr &MI) {
+    switch (MI.getOpcode()) {
+    case AMDGPU::BUFFER_LOAD_DWORD_LDS_OFFEN:
+    case AMDGPU::BUFFER_LOAD_DWORD_LDS_IDXEN:
+    case AMDGPU::BUFFER_LOAD_DWORD_LDS_BOTHEN:
+    case AMDGPU::BUFFER_LOAD_DWORD_LDS_OFFSET:
+    case AMDGPU::BUFFER_LOAD_USHORT_LDS_OFFEN:
+    case AMDGPU::BUFFER_LOAD_USHORT_LDS_IDXEN:
+    case AMDGPU::BUFFER_LOAD_USHORT_LDS_BOTHEN:
+    case AMDGPU::BUFFER_LOAD_USHORT_LDS_OFFSET:
+    case AMDGPU::BUFFER_LOAD_UBYTE_LDS_OFFEN:
+    case AMDGPU::BUFFER_LOAD_UBYTE_LDS_IDXEN:
+    case AMDGPU::BUFFER_LOAD_UBYTE_LDS_BOTHEN:
+    case AMDGPU::BUFFER_LOAD_UBYTE_LDS_OFFSET:
+      return true;
+    default:
+      return false;
+    }
+  }
+
   bool findReadMFMAChain(MachineBasicBlock &MBB,
                          SmallVectorImpl<ReadMFMAPair> &Chain);
+  bool findGEMM2Chain(MachineBasicBlock &MBB, MachineInstr *AfterBarrier,
+                      SmallVectorImpl<ReadMFMAPair> &Chain);
   bool findBarrierPair(MachineBasicBlock &MBB,
                        const SmallVectorImpl<ReadMFMAPair> &Chain,
                        MachineInstr *&Barrier1, MachineInstr *&Barrier2);
@@ -82,6 +106,10 @@ class SIGEMMScheduleOptimize {
                              MachineInstr *Barrier1, MachineInstr *Barrier2,
                              VLoadInfo &VHi, VLoadInfo &VLo);
 
+  Register findFreeVReg64(MachineBasicBlock &MBB);
+  bool doubleBufferChain(MachineBasicBlock &MBB,
+                         SmallVectorImpl<ReadMFMAPair> &Chain,
+                         unsigned StartIdx);
   bool processLoop(MachineBasicBlock &MBB);
 
 public:
@@ -281,75 +309,301 @@ found_addr:
   return VHi.Writes.size() >= 2 && VLo.Writes.size() >= 2;
 }
 
+// Find the GEMM2 ds_read/MFMA chain starting after AfterBarrier.
+// Unlike GEMM1, GEMM2 uses different base registers per read (precomputed
+// V^T addresses), so we only require a consistent dest register.
+bool SIGEMMScheduleOptimize::findGEMM2Chain(
+    MachineBasicBlock &MBB, MachineInstr *AfterBarrier,
+    SmallVectorImpl<ReadMFMAPair> &Chain) {
+  Chain.clear();
+  Register ReadDstReg;
+  bool PastBarrier = false;
+
+  for (auto II = MBB.begin(), IE = MBB.end(); II != IE;) {
+    MachineInstr &MI = *II;
+    if (&MI == AfterBarrier)
+      PastBarrier = true;
+    ++II;
+    if (!PastBarrier)
+      continue;
+    if (!isDSRead2B32(MI))
+      continue;
+
+    Register DstReg = MI.getOperand(0).getReg();
+    if (Chain.empty()) {
+      ReadDstReg = DstReg;
+    } else if (DstReg != ReadDstReg) {
+      break;
+    }
+
+    MachineInstr *PairedMFMA = nullptr;
+    for (auto JJ = II; JJ != IE; ++JJ) {
+      if (!SIInstrInfo::isMFMA(*JJ))
+        continue;
+      if (JJ->getOperand(1).isReg() &&
+          JJ->getOperand(1).getReg() == ReadDstReg) {
+        PairedMFMA = &*JJ;
+        II = std::next(MachineBasicBlock::iterator(PairedMFMA));
+        break;
+      }
+      break;
+    }
+    if (!PairedMFMA)
+      break;
+    Chain.push_back({&MI, PairedMFMA});
+  }
+  return Chain.size() >= MinChainLength;
+}
+
+Register SIGEMMScheduleOptimize::findFreeVReg64(MachineBasicBlock &MBB) {
+  DenseSet<unsigned> UsedVGPR32;
+  for (auto &MI : MBB) {
+    for (const auto &MO : MI.operands()) {
+      if (!MO.isReg() || !MO.getReg().isPhysical())
+        continue;
+      MCRegister Reg = MO.getReg().asMCReg();
+      if (AMDGPU::VGPR_32RegClass.contains(Reg))
+        UsedVGPR32.insert(Reg);
+      for (MCRegister Sub : TRI->subregs(Reg))
+        if (AMDGPU::VGPR_32RegClass.contains(Sub))
+          UsedVGPR32.insert(Sub);
+    }
+  }
+  for (const auto &LI : MBB.liveins()) {
+    MCRegister Reg = LI.PhysReg;
+    if (AMDGPU::VGPR_32RegClass.contains(Reg))
+      UsedVGPR32.insert(Reg);
+    for (MCRegister Sub : TRI->subregs(Reg))
+      if (AMDGPU::VGPR_32RegClass.contains(Sub))
+        UsedVGPR32.insert(Sub);
+  }
+  for (unsigned R = 0; R < AMDGPU::VReg_64RegClass.getNumRegs(); ++R) {
+    MCRegister P = AMDGPU::VReg_64RegClass.getRegister(R);
+    bool Free = true;
+    for (MCRegister Sub : TRI->subregs(P))
+      if (AMDGPU::VGPR_32RegClass.contains(Sub) && UsedVGPR32.count(Sub)) {
+        Free = false;
+        break;
+      }
+    if (Free)
+      return P;
+  }
+  return Register();
+}
+
+// Apply double-buffering to a ds_read/MFMA chain starting at index StartIdx.
+// Reorders reads so that Read[i+1] is issued before MFMA[i], and alternates
+// the dest register between BufA (original) and BufB (free register).
+bool SIGEMMScheduleOptimize::doubleBufferChain(
+    MachineBasicBlock &MBB, SmallVectorImpl<ReadMFMAPair> &Chain,
+    unsigned StartIdx) {
+  unsigned N = Chain.size();
+  if (StartIdx >= N || N - StartIdx < 2)
+    return false;
+
+  Register BufA = Chain[StartIdx].Read->getOperand(0).getReg();
+  Register BufB = findFreeVReg64(MBB);
+  {
+    std::ofstream log("/tmp/gemmopt_diag.txt", std::ios::app);
+    log << "[T4-DB] N=" << N << " StartIdx=" << StartIdx
+        << " BufA=" << TRI->getName(BufA)
+        << " BufB=" << (BufB ? TRI->getName(BufB) : "NONE")
+        << "\n";
+    for (unsigned i = 0; i < N; ++i) {
+      log << "  [" << i << "] Read dst=" << TRI->getName(Chain[i].Read->getOperand(0).getReg())
+          << " MFMA srcA=" << TRI->getName(Chain[i].MFMA->getOperand(1).getReg())
+          << "\n";
+    }
+  }
+  if (!BufB)
+    return false;
+
+  // Move Read[StartIdx+1] before MFMA[StartIdx], set dest to BufB
+  if (StartIdx + 1 < N) {
+    MachineInstr *R1 = Chain[StartIdx + 1].Read;
+    R1->removeFromParent();
+    MBB.insert(MachineBasicBlock::iterator(Chain[StartIdx].MFMA), R1);
+    R1->getOperand(0).setReg(BufB);
+  }
+
+  // For StartIdx+1..N-2: move Read[i+1] before MFMA[i], alternate bufs
+  for (unsigned i = StartIdx + 1; i < N - 1; ++i) {
+    unsigned relIdx = i - StartIdx;
+    bool UseB = (relIdx % 2 == 1);
+    Register UseBuf = UseB ? BufB : BufA;
+    Register PrefBuf = UseB ? BufA : BufB;
+
+    Chain[i].MFMA->getOperand(1).setReg(UseBuf);
+
+    MachineInstr *NextRead = Chain[i + 1].Read;
+    NextRead->removeFromParent();
+    MBB.insert(MachineBasicBlock::iterator(Chain[i].MFMA), NextRead);
+    NextRead->getOperand(0).setReg(PrefBuf);
+  }
+
+  // Last MFMA uses the last-written buffer
+  {
+    unsigned relIdx = (N - 1) - StartIdx;
+    bool UseB = (relIdx % 2 == 1);
+    Chain[N - 1].MFMA->getOperand(1).setReg(UseB ? BufB : BufA);
+  }
+  {
+    std::ofstream log("/tmp/gemmopt_diag.txt", std::ios::app);
+    log << "[T4-DB] After transform:\n";
+    for (unsigned i = 0; i < N; ++i) {
+      log << "  [" << i << "] Read dst=" << TRI->getName(Chain[i].Read->getOperand(0).getReg())
+          << " MFMA srcA=" << TRI->getName(Chain[i].MFMA->getOperand(1).getReg())
+          << "\n";
+    }
+  }
+  return true;
+}
+
 // ===================================================================
 // Transformations
 // ===================================================================
 
 bool SIGEMMScheduleOptimize::processLoop(MachineBasicBlock &MBB) {
-  // Step 1: Find GEMM1 chain
-  SmallVector<ReadMFMAPair, 32> Chain;
-  if (!findReadMFMAChain(MBB, Chain))
-    return false;
-
-  unsigned N = Chain.size();
-
-  MachineInstr *Barrier1 = nullptr, *Barrier2 = nullptr;
-  if (!findBarrierPair(MBB, Chain, Barrier1, Barrier2))
-    return false;
-
-  VLoadInfo VHi, VLo;
-  if (!findVLoadWritePattern(MBB, Barrier1, Barrier2, VHi, VLo))
-    return false;
-
-  // Determine how many V hi/lo writes go into each GEMM1 slot.
-  // Script uses 2 writes per MFMA slot.
-  unsigned VHiWritesPerSlot = 2;
-  unsigned VLoWritesPerSlot = 2;
-  unsigned VHiSlots = std::min((unsigned)VHi.Writes.size() / VHiWritesPerSlot,
-                               std::min(N, 4u));
-  unsigned VLoSlots = std::min((unsigned)VLo.Writes.size() / VLoWritesPerSlot,
-                               std::min(N - VHiSlots, 4u));
-  unsigned DBStart = VHiSlots;
-  unsigned VLoStart = N > (VLoSlots + 2) ? N - VLoSlots - 2 : DBStart;
-
-  // ===== T1: Hoist V loads before Barrier1 =====
-  auto BarrierIt = MachineBasicBlock::iterator(Barrier1);
-  // Find the lgkmcnt(0) / s_waitcnt before barrier (if any pre-existing waitcnt)
-  // Since we run pre-waitcnt, there might be one from SIMemoryLegalizer.
-  // We insert before the barrier itself.
-
-  if (VHi.AddrCompute) {
-    VHi.AddrCompute->removeFromParent();
-    MBB.insert(BarrierIt, VHi.AddrCompute);
+  {
+    std::ofstream log("/tmp/gemmopt_diag.txt", std::ios::app);
+    log << "[GEMMOpt] processLoop entered, MBB=" << MBB.getName().str() << "\n";
   }
-  VHi.Load->removeFromParent();
-  MBB.insert(BarrierIt, VHi.Load);
-  VLo.Load->removeFromParent();
-  MBB.insert(BarrierIt, VLo.Load);
 
-  // ===== T3a: Interleave V hi writes into GEMM1 #0..VHiSlots-1 =====
-  unsigned vhiIdx = 0;
-  for (unsigned i = 0; i < VHiSlots && vhiIdx < VHi.Writes.size(); ++i) {
-    auto InsertPt = MachineBasicBlock::iterator(Chain[i].MFMA);
-    for (unsigned w = 0; w < VHiWritesPerSlot && vhiIdx < VHi.Writes.size();
-         ++w, ++vhiIdx) {
-      MachineInstr *VW = VHi.Writes[vhiIdx];
-      VW->removeFromParent();
-      MBB.insert(InsertPt, VW);
+  // Skip when async buffer_load→LDS (DMA) is detected.  The new CK-aligned
+  // pipeline manages its own K prefetch via buffer_load_dword...lds;
+  // T1-T5 transformations are not applicable and could corrupt the schedule.
+  for (const MachineInstr &MI : MBB) {
+    if (isBufferLoadLDS(MI)) {
+      std::ofstream log("/tmp/gemmopt_diag.txt", std::ios::app);
+      log << "[GEMMOpt] Async buffer_load→LDS detected, skipping MBB\n";
+      return false;
     }
   }
-  // ===== T2: K double-buffer for GEMM1 #DBStart..N-1 =====
-  // SecondBuf = first VReg_64 sub-register of VHi.LoadDest (now dead)
-  Register SecondBuf;
+
+  // Step 1: Find GEMM1 chain
+  SmallVector<ReadMFMAPair, 32> Chain;
+  if (!findReadMFMAChain(MBB, Chain)) {
+    std::ofstream log("/tmp/gemmopt_diag.txt", std::ios::app);
+    log << "[GEMMOpt] findReadMFMAChain FAILED, chain_size=" << Chain.size() << "\n";
+    return false;
+  }
+
+  unsigned N = Chain.size();
   {
-    // Find the VReg_64 containing the first two sub-regs of VHi.LoadDest
+    std::ofstream log("/tmp/gemmopt_diag.txt", std::ios::app);
+    log << "[GEMMOpt] GEMM1 chain found, N=" << N << "\n";
+  }
+
+  MachineInstr *Barrier1 = nullptr, *Barrier2 = nullptr;
+  if (!findBarrierPair(MBB, Chain, Barrier1, Barrier2)) {
+    std::ofstream log("/tmp/gemmopt_diag.txt", std::ios::app);
+    log << "[GEMMOpt] findBarrierPair FAILED\n";
+    return false;
+  }
+  {
+    std::ofstream log("/tmp/gemmopt_diag.txt", std::ios::app);
+    log << "[GEMMOpt] barriers found\n";
+  }
+
+  // ===== T5: Sink V global loads to just before Barrier1 =====
+  // In the original schedule, V and K global loads are interleaved:
+  //   K1, V1, V2, ds_write(K1), K2, ds_write(K1), ds_write(K2)...
+  // This forces vmcnt to wait for V loads even though their data isn't
+  // needed until after GEMM1.  By sinking V loads to just before
+  // Barrier1, the vmcnt for K ds_writes only counts K loads.  V loads
+  // remain in-flight through the barrier and GEMM1, hiding HBM latency
+  // (gfx942 BackOffBarrier: no vmcnt(0) inserted before S_BARRIER).
+  {
+    SmallVector<MachineInstr *, 4> VLoadsToSink;
+    for (auto II = MBB.begin(), IE = MBB.end(); II != IE; ++II) {
+      if (&*II == Barrier1)
+        break;
+      if (!isGlobalLoadDwordX4(*II))
+        continue;
+
+      Register Dst = II->getOperand(0).getReg();
+      bool ConsumedBeforeBarrier = false;
+      for (auto JJ = std::next(II); JJ != IE; ++JJ) {
+        if (&*JJ == Barrier1)
+          break;
+        for (const MachineOperand &MO : JJ->operands()) {
+          if (MO.isReg() && MO.isUse() && TRI->regsOverlap(MO.getReg(), Dst)) {
+            ConsumedBeforeBarrier = true;
+            break;
+          }
+        }
+        if (ConsumedBeforeBarrier)
+          break;
+      }
+      if (!ConsumedBeforeBarrier)
+        VLoadsToSink.push_back(&*II);
+    }
+
+    if (!VLoadsToSink.empty()) {
+      auto InsertPt = MachineBasicBlock::iterator(Barrier1);
+      for (MachineInstr *VL : VLoadsToSink) {
+        VL->removeFromParent();
+        MBB.insert(InsertPt, VL);
+      }
+      std::ofstream log("/tmp/gemmopt_diag.txt", std::ios::app);
+      log << "[GEMMOpt-T5] Sank " << VLoadsToSink.size()
+          << " V global loads to just before Barrier1\n";
+    } else {
+      std::ofstream log("/tmp/gemmopt_diag.txt", std::ios::app);
+      log << "[GEMMOpt-T5] No sinkable V global loads found\n";
+    }
+  }
+
+  VLoadInfo VHi, VLo;
+  bool HasVLoadPattern = findVLoadWritePattern(MBB, Barrier1, Barrier2, VHi, VLo);
+  {
+    std::ofstream log("/tmp/gemmopt_diag.txt", std::ios::app);
+    log << "[GEMMOpt] VLoad pattern: " << HasVLoadPattern << "\n";
+  }
+
+  unsigned DBStart = 0;
+  Register SecondBuf;
+
+  if (HasVLoadPattern) {
+    unsigned VHiWritesPerSlot = 2;
+    unsigned VLoWritesPerSlot = 2;
+    unsigned VHiSlots = std::min((unsigned)VHi.Writes.size() / VHiWritesPerSlot,
+                                 std::min(N, 4u));
+    unsigned VLoSlots = std::min((unsigned)VLo.Writes.size() / VLoWritesPerSlot,
+                                 std::min(N - VHiSlots, 4u));
+    DBStart = VHiSlots;
+    unsigned VLoStart = N > (VLoSlots + 2) ? N - VLoSlots - 2 : DBStart;
+
+    // ===== T1: Hoist V loads before Barrier1 =====
+    auto BarrierIt = MachineBasicBlock::iterator(Barrier1);
+    if (VHi.AddrCompute) {
+      VHi.AddrCompute->removeFromParent();
+      MBB.insert(BarrierIt, VHi.AddrCompute);
+    }
+    VHi.Load->removeFromParent();
+    MBB.insert(BarrierIt, VHi.Load);
+    VLo.Load->removeFromParent();
+    MBB.insert(BarrierIt, VLo.Load);
+
+    // ===== T3a: Interleave V hi writes into GEMM1 #0..VHiSlots-1 =====
+    unsigned vhiIdx = 0;
+    for (unsigned i = 0; i < VHiSlots && vhiIdx < VHi.Writes.size(); ++i) {
+      auto InsertPt = MachineBasicBlock::iterator(Chain[i].MFMA);
+      for (unsigned w = 0; w < VHiWritesPerSlot && vhiIdx < VHi.Writes.size();
+           ++w, ++vhiIdx) {
+        MachineInstr *VW = VHi.Writes[vhiIdx];
+        VW->removeFromParent();
+        MBB.insert(InsertPt, VW);
+      }
+    }
+
+    // SecondBuf from VHi.LoadDest sub-register
     SmallVector<MCRegister, 4> HiSubs;
     for (MCRegister Sub : TRI->subregs(VHi.LoadDest.asMCReg())) {
       if (AMDGPU::VGPR_32RegClass.contains(Sub))
         HiSubs.push_back(Sub);
     }
     if (HiSubs.size() >= 2) {
-      // Find the VReg_64 super-register of HiSubs[0] and HiSubs[1]
       for (MCRegister Super : TRI->superregs(HiSubs[0])) {
         if (AMDGPU::VReg_64RegClass.contains(Super) &&
             TRI->isSubRegisterEq(Super, HiSubs[1])) {
@@ -358,90 +612,86 @@ bool SIGEMMScheduleOptimize::processLoop(MachineBasicBlock &MBB) {
         }
       }
     }
-  }
 
-  if (!SecondBuf) {
-    DenseSet<unsigned> UsedVGPR32;
-    for (auto &MI : MBB) {
-      for (const auto &MO : MI.operands()) {
-        if (!MO.isReg() || !MO.getReg().isPhysical()) continue;
-        MCRegister Reg = MO.getReg().asMCReg();
-        if (AMDGPU::VGPR_32RegClass.contains(Reg))
-          UsedVGPR32.insert(Reg);
-        for (MCRegister Sub : TRI->subregs(Reg))
-          if (AMDGPU::VGPR_32RegClass.contains(Sub))
-            UsedVGPR32.insert(Sub);
+    // ===== T3b: Interleave V lo writes into GEMM1 tail =====
+    unsigned vloIdx = 0;
+    for (unsigned i = 0; i < VLoSlots && vloIdx < VLo.Writes.size(); ++i) {
+      unsigned chainIdx = VLoStart + i;
+      if (chainIdx >= N) break;
+      auto InsertPt = MachineBasicBlock::iterator(Chain[chainIdx].MFMA);
+      for (unsigned w = 0; w < VLoWritesPerSlot && vloIdx < VLo.Writes.size();
+           ++w, ++vloIdx) {
+        MachineInstr *VW = VLo.Writes[vloIdx];
+        VW->removeFromParent();
+        MBB.insert(InsertPt, VW);
       }
     }
-    for (const auto &LI : MBB.liveins()) {
-      MCRegister Reg = LI.PhysReg;
-      if (AMDGPU::VGPR_32RegClass.contains(Reg))
-        UsedVGPR32.insert(Reg);
-      for (MCRegister Sub : TRI->subregs(Reg))
-        if (AMDGPU::VGPR_32RegClass.contains(Sub))
-          UsedVGPR32.insert(Sub);
-    }
-    for (unsigned R = 0; R < AMDGPU::VReg_64RegClass.getNumRegs(); ++R) {
-      MCRegister P = AMDGPU::VReg_64RegClass.getRegister(R);
-      bool Free = true;
-      for (MCRegister Sub : TRI->subregs(P))
-        if (AMDGPU::VGPR_32RegClass.contains(Sub) && UsedVGPR32.count(Sub))
-          { Free = false; break; }
-      if (Free) { SecondBuf = P; break; }
-    }
   }
 
+  // ===== T2: K double-buffer for GEMM1 #DBStart..N-1 =====
   if (!SecondBuf)
-    return true;
+    SecondBuf = findFreeVReg64(MBB);
 
-  Register BufA = Chain[0].Read->getOperand(0).getReg();
-  Register BufB = SecondBuf;
+  if (SecondBuf) {
+    Register BufA = Chain[0].Read->getOperand(0).getReg();
+    Register BufB = SecondBuf;
 
-  if (DBStart < N && N - DBStart >= 2) {
-    // Move Read[DBStart+1] before MFMA[DBStart], set dest to BufB
-    if (DBStart + 1 < N) {
-      MachineInstr *R1 = Chain[DBStart + 1].Read;
-      R1->removeFromParent();
-      MBB.insert(MachineBasicBlock::iterator(Chain[DBStart].MFMA), R1);
-      R1->getOperand(0).setReg(BufB);
-    }
+    if (DBStart < N && N - DBStart >= 2) {
+      if (DBStart + 1 < N) {
+        MachineInstr *R1 = Chain[DBStart + 1].Read;
+        R1->removeFromParent();
+        MBB.insert(MachineBasicBlock::iterator(Chain[DBStart].MFMA), R1);
+        R1->getOperand(0).setReg(BufB);
+      }
 
-    // For DBStart+1..N-2: move Read[i+1] before MFMA[i], alternate bufs
-    for (unsigned i = DBStart + 1; i < N - 1; ++i) {
-      unsigned relIdx = i - DBStart;
-      bool UseB = (relIdx % 2 == 1);
-      Register UseBuf = UseB ? BufB : BufA;
-      Register PrefBuf = UseB ? BufA : BufB;
+      for (unsigned i = DBStart + 1; i < N - 1; ++i) {
+        unsigned relIdx = i - DBStart;
+        bool UseB = (relIdx % 2 == 1);
+        Register UseBuf = UseB ? BufB : BufA;
+        Register PrefBuf = UseB ? BufA : BufB;
 
-      Chain[i].MFMA->getOperand(1).setReg(UseBuf);
+        Chain[i].MFMA->getOperand(1).setReg(UseBuf);
 
-      MachineInstr *NextRead = Chain[i + 1].Read;
-      NextRead->removeFromParent();
-      MBB.insert(MachineBasicBlock::iterator(Chain[i].MFMA), NextRead);
-      NextRead->getOperand(0).setReg(PrefBuf);
-    }
+        MachineInstr *NextRead = Chain[i + 1].Read;
+        NextRead->removeFromParent();
+        MBB.insert(MachineBasicBlock::iterator(Chain[i].MFMA), NextRead);
+        NextRead->getOperand(0).setReg(PrefBuf);
+      }
 
-    // Last MFMA uses the last-written buffer
-    {
       unsigned relIdx = (N - 1) - DBStart;
       bool UseB = (relIdx % 2 == 1);
       Chain[N - 1].MFMA->getOperand(1).setReg(UseB ? BufB : BufA);
     }
   }
 
-  // ===== T3b: Interleave V lo writes into GEMM1 #VLoStart..VLoStart+VLoSlots-1 =====
-  unsigned vloIdx = 0;
-  for (unsigned i = 0; i < VLoSlots && vloIdx < VLo.Writes.size(); ++i) {
-    unsigned chainIdx = VLoStart + i;
-    if (chainIdx >= N) break;
-    auto InsertPt = MachineBasicBlock::iterator(Chain[chainIdx].MFMA);
-    for (unsigned w = 0; w < VLoWritesPerSlot && vloIdx < VLo.Writes.size();
-         ++w, ++vloIdx) {
-      MachineInstr *VW = VLo.Writes[vloIdx];
-      VW->removeFromParent();
-      MBB.insert(InsertPt, VW);
+  // ===== T4: Double-buffer GEMM2 (V^T read / MFMA chain after Barrier2) =====
+  SmallVector<ReadMFMAPair, 32> G2Chain;
+  bool FoundG2 = findGEMM2Chain(MBB, Barrier2, G2Chain);
+  {
+    std::ofstream log("/tmp/gemmopt_diag.txt", std::ios::app);
+    log << "[GEMMOpt-T4] GEMM2 chain: found=" << FoundG2
+        << " size=" << G2Chain.size() << "\n";
+  }
+  if (FoundG2) {
+    bool DB = doubleBufferChain(MBB, G2Chain, 0);
+    std::ofstream log("/tmp/gemmopt_diag.txt", std::ios::app);
+    log << "[GEMMOpt-T4] doubleBufferChain result=" << DB << "\n";
+    // Dump GEMM2 instructions after transform
+    log << "[GEMMOpt-T4] Post-T4 GEMM2 section:\n";
+    bool inGemm2 = false;
+    for (auto II = MBB.begin(), IE = MBB.end(); II != IE; ++II) {
+      if (&*II == Barrier2) inGemm2 = true;
+      if (!inGemm2) continue;
+      std::string buf;
+      raw_string_ostream os(buf);
+      II->print(os);
+      log << "  " << os.str();
+      if (II->getOpcode() == AMDGPU::S_CBRANCH_VCCNZ ||
+          II->getOpcode() == AMDGPU::S_BRANCH)
+        break;
     }
   }
+
   return true;
 }
 
@@ -451,6 +701,11 @@ bool SIGEMMScheduleOptimize::run(MachineFunction &MF) {
   bool Enable = EnableGEMMScheduleOpt;
   if (GSOAttr.isValid())
     Enable = (GSOAttr.getValueAsString() != "false");
+  {
+    std::ofstream log("/tmp/gemmopt_diag.txt", std::ios::app);
+    log << "[GEMMOpt] run() Enable=" << Enable
+        << " fn=" << F.getName().str() << "\n";
+  }
   if (!Enable)
     return false;
 

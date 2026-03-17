@@ -382,7 +382,8 @@ def ROCDL_GridDimZOp : ROCDL_DimGetterFunctionOp<"grid.dim.z",
 
 // Emits the waintcnt instruction. The bitfield's semantics depend
 // on the target chipset
-def ROCDL_SWaitcntOp : ROCDL_ConcreteNonMemIntrOp<"s.waitcnt", [], 0, [0], ["bitfield"]>,
+def ROCDL_SWaitcntOp : ROCDL_ConcreteNonMemIntrOp<"s.waitcnt",
+    [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>], 0, [0], ["bitfield"]>,
   Arguments<(ins I32Attr:$bitfield)> {
   let assemblyFormat = "attr-dict $bitfield";
 }
@@ -591,7 +592,8 @@ def ROCDL_SetPrioOp : ROCDL_ConcreteNonMemIntrOp<"s.setprio", [], 0, [0], ["prio
   let assemblyFormat = "$priority attr-dict";
 }
 
-def ROCDL_SchedBarrier : ROCDL_ConcreteNonMemIntrOp<"sched.barrier", [], 0, [0],["mask"]>,
+def ROCDL_SchedBarrier : ROCDL_ConcreteNonMemIntrOp<"sched.barrier",
+    [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>], 0, [0],["mask"]>,
   Arguments<(ins I32Attr:$mask)> {
   let assemblyFormat = "$mask attr-dict";
 }
