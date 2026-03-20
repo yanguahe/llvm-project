@@ -1441,6 +1441,11 @@ public:
   /// \returns true if the target has instructions with xf32 format support.
   bool hasXF32Insts() const { return HasXF32Insts; }
 
+  /// Returns the necessary reduction in number of VGPRs from using \p VGPRs
+  /// VGPRs to increase occupancy by 1. Returns 0 when using \p VGPRs VGPRs
+  /// already results in maximum occupancy.
+  unsigned getNumVGPRsToIncreaseOccupancy(unsigned VGPRs) const;
+
   /// \returns true if the target has packed f32 instructions that only read 32
   /// bits from a scalar operand (SGPR or literal) and replicates the bits to
   /// both channels.

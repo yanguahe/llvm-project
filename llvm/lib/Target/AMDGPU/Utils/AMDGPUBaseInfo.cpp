@@ -1345,6 +1345,19 @@ unsigned getNumSGPRBlocks(const MCSubtargetInfo *STI, unsigned NumSGPRs) {
          1;
 }
 
+unsigned getVGPRReductionToIncreaseWavesPerEU(const MCSubtargetInfo *STI,
+                                              unsigned NumVGPRs) {
+  unsigned Granule = getVGPRAllocGranule(STI, 0, std::nullopt);
+  unsigned MaxWaves = getMaxWavesPerEU(STI);
+  unsigned TotalNumVGPRs = getTotalNumVGPRs(STI);
+
+  unsigned NumWaves =
+      getNumWavesPerEUWithNumVGPRs(NumVGPRs, Granule, MaxWaves, TotalNumVGPRs);
+  if (NumWaves == MaxWaves)
+    return 0;
+  return NumVGPRs - alignDown(TotalNumVGPRs / (NumWaves + 1), Granule);
+}
+
 unsigned getVGPRAllocGranule(const MCSubtargetInfo *STI,
                              unsigned DynamicVGPRBlockSize,
                              std::optional<bool> EnableWavefrontSize32) {
