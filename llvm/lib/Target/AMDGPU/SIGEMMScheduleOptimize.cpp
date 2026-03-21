@@ -61,6 +61,16 @@ class SIGEMMScheduleOptimize {
     return Opc == AMDGPU::DS_READ2_B32 || Opc == AMDGPU::DS_READ2_B32_gfx9;
   }
 
+  static bool isDSReadB128(const MachineInstr &MI) {
+    unsigned Opc = MI.getOpcode();
+    return Opc == AMDGPU::DS_READ_B128 || Opc == AMDGPU::DS_READ_B128_gfx9;
+  }
+
+  static bool isDSWrite2B32(const MachineInstr &MI) {
+    unsigned Opc = MI.getOpcode();
+    return Opc == AMDGPU::DS_WRITE2_B32 || Opc == AMDGPU::DS_WRITE2_B32_gfx9;
+  }
+
   static bool isDSWriteB16(const MachineInstr &MI) {
     unsigned Opc = MI.getOpcode();
     return Opc == AMDGPU::DS_WRITE_B16 || Opc == AMDGPU::DS_WRITE_B16_gfx9 ||
@@ -110,6 +120,9 @@ class SIGEMMScheduleOptimize {
   bool doubleBufferChain(MachineBasicBlock &MBB,
                          SmallVectorImpl<ReadMFMAPair> &Chain,
                          unsigned StartIdx);
+  bool hoistVWritesFromGEMM1(MachineBasicBlock &MBB,
+                             MachineInstr *B1, MachineInstr *B2);
+  bool processAsyncDMALoop(MachineBasicBlock &MBB);
   bool processLoop(MachineBasicBlock &MBB);
 
 public:
@@ -463,29 +476,200 @@ bool SIGEMMScheduleOptimize::doubleBufferChain(
 // Transformations
 // ===================================================================
 
+// T6: Hoist V ds_write2_b32 instructions from inside the GEMM1 MFMA chain
+// to just before the B2 barrier, with full register-conflict checking.
+// Also hoists VALU instructions (v_perm_b32 etc.) that feed the writes.
+bool SIGEMMScheduleOptimize::hoistVWritesFromGEMM1(
+    MachineBasicBlock &MBB, MachineInstr *B1, MachineInstr *B2) {
+  SmallVector<MachineInstr *, 4> VWrites;
+  SmallVector<MachineInstr *, 32> MFMAs;
+  bool PastB1 = false;
+  for (auto II = MBB.begin(), IE = MBB.end(); II != IE; ++II) {
+    if (&*II == B1) PastB1 = true;
+    if (&*II == B2) break;
+    if (!PastB1) continue;
+    if (isDSWrite2B32(*II))
+      VWrites.push_back(&*II);
+    if (SIInstrInfo::isMFMA(*II))
+      MFMAs.push_back(&*II);
+  }
+
+  if (VWrites.empty() || MFMAs.size() < 2)
+    return false;
+
+  MachineInstr *FirstMFMA = MFMAs.front();
+  MachineInstr *LastMFMA = MFMAs.back();
+
+  // Find V writes that are strictly between first and last MFMA.
+  SmallVector<MachineInstr *, 4> WritesToMove;
+  for (MachineInstr *VW : VWrites) {
+    bool AfterFirst = false;
+    for (auto II = MBB.begin(), IE = MBB.end(); II != IE; ++II) {
+      if (&*II == FirstMFMA) AfterFirst = true;
+      if (&*II == LastMFMA) break;
+      if (&*II == VW && AfterFirst) {
+        WritesToMove.push_back(VW);
+        break;
+      }
+    }
+  }
+  if (WritesToMove.empty())
+    return false;
+
+  // Collect the V writes and their source-defining VALU instructions,
+  // preserving topological order (defs before uses).
+  SmallVector<MachineInstr *, 8> InstsToMove;
+  DenseSet<MachineInstr *> InMoveSet;
+
+  for (MachineInstr *VW : WritesToMove) {
+    // Find VALU defs for each data operand of the write.
+    for (const MachineOperand &MO : VW->operands()) {
+      if (!MO.isReg() || MO.isDef() || !MO.getReg().isPhysical())
+        continue;
+      Register DataReg = MO.getReg();
+      for (auto RI = MachineBasicBlock::reverse_iterator(VW->getIterator()),
+                RE = MBB.rend(); RI != RE; ++RI) {
+        if (&*RI == B1) break;
+        if (SIInstrInfo::isMFMA(*RI)) break;
+        bool DefinesReg = false;
+        for (const MachineOperand &DO : RI->operands()) {
+          if (DO.isReg() && DO.isDef() &&
+              TRI->regsOverlap(DO.getReg(), DataReg)) {
+            DefinesReg = true;
+            break;
+          }
+        }
+        if (DefinesReg && !InMoveSet.count(&*RI)) {
+          InstsToMove.push_back(&*RI);
+          InMoveSet.insert(&*RI);
+          break;
+        }
+      }
+    }
+    if (!InMoveSet.count(VW)) {
+      InstsToMove.push_back(VW);
+      InMoveSet.insert(VW);
+    }
+  }
+
+  // Safety check: verify no register conflicts with instructions in between.
+  // For each instruction being moved, check that no instruction between its
+  // current position and B2 writes to any register it reads, OR reads any
+  // register it writes to.
+  DenseSet<unsigned> MoveReads, MoveWrites;
+  for (MachineInstr *MI : InstsToMove) {
+    for (const MachineOperand &MO : MI->operands()) {
+      if (!MO.isReg() || !MO.getReg().isPhysical()) continue;
+      if (MO.isUse()) {
+        MoveReads.insert(MO.getReg());
+        for (MCRegister Sub : TRI->subregs(MO.getReg().asMCReg()))
+          MoveReads.insert(Sub);
+      }
+      if (MO.isDef()) {
+        MoveWrites.insert(MO.getReg());
+        for (MCRegister Sub : TRI->subregs(MO.getReg().asMCReg()))
+          MoveWrites.insert(Sub);
+      }
+    }
+  }
+
+  // Check instructions between last moved instruction and B2.
+  MachineInstr *LastMoved = InstsToMove.back();
+  bool Conflict = false;
+  bool PastLastMoved = false;
+  for (auto II = MBB.begin(), IE = MBB.end(); II != IE; ++II) {
+    if (&*II == LastMoved) { PastLastMoved = true; continue; }
+    if (&*II == B2) break;
+    if (!PastLastMoved) continue;
+    if (InMoveSet.count(&*II)) continue;
+
+    for (const MachineOperand &MO : II->operands()) {
+      if (!MO.isReg() || !MO.getReg().isPhysical()) continue;
+      unsigned R = MO.getReg();
+      // WAR: intervening write to a register we read.
+      if (MO.isDef() && MoveReads.count(R)) { Conflict = true; break; }
+      // RAW: intervening read of a register we write.
+      if (MO.isUse() && MoveWrites.count(R)) { Conflict = true; break; }
+      // Check sub-registers too.
+      for (MCRegister Sub : TRI->subregs(MCRegister(R))) {
+        if (MO.isDef() && MoveReads.count(Sub)) { Conflict = true; break; }
+        if (MO.isUse() && MoveWrites.count(Sub)) { Conflict = true; break; }
+      }
+      if (Conflict) break;
+    }
+    if (Conflict) break;
+  }
+
+  if (Conflict) {
+    std::ofstream log("/tmp/gemmopt_diag.txt", std::ios::app);
+    log << "[GEMMOpt-T6] Register conflict detected, skipping hoist\n";
+    return false;
+  }
+
+  auto InsertPt = MachineBasicBlock::iterator(B2);
+  for (MachineInstr *MI : InstsToMove) {
+    MI->removeFromParent();
+    MBB.insert(InsertPt, MI);
+  }
+
+  {
+    std::ofstream log("/tmp/gemmopt_diag.txt", std::ios::app);
+    log << "[GEMMOpt-T6] Hoisted " << InstsToMove.size()
+        << " insts (" << WritesToMove.size() << " V writes) to before B2\n";
+  }
+  return true;
+}
+
+// Process a loop body using async DMA for K loading (FlyDSL pattern).
+bool SIGEMMScheduleOptimize::processAsyncDMALoop(MachineBasicBlock &MBB) {
+  SmallVector<MachineInstr *, 8> Barriers;
+  for (auto &MI : MBB) {
+    if (MI.getOpcode() == AMDGPU::S_BARRIER)
+      Barriers.push_back(&MI);
+  }
+  if (Barriers.size() < 2)
+    return false;
+
+  bool Changed = false;
+  for (unsigned bi = 0; bi + 1 < Barriers.size(); bi += 2) {
+    Changed |= hoistVWritesFromGEMM1(MBB, Barriers[bi], Barriers[bi + 1]);
+  }
+
+  {
+    std::ofstream log("/tmp/gemmopt_diag.txt", std::ios::app);
+    log << "[GEMMOpt-AsyncDMA] Changed=" << Changed
+        << " barriers=" << Barriers.size() << "\n";
+  }
+  return Changed;
+}
+
 bool SIGEMMScheduleOptimize::processLoop(MachineBasicBlock &MBB) {
   {
     std::ofstream log("/tmp/gemmopt_diag.txt", std::ios::app);
     log << "[GEMMOpt] processLoop entered, MBB=" << MBB.getName().str() << "\n";
   }
 
-  // Skip when async buffer_load→LDS (DMA) is detected.  The new CK-aligned
-  // pipeline manages its own K prefetch via buffer_load_dword...lds;
-  // T1-T5 transformations are not applicable and could corrupt the schedule.
+  bool HasAsyncDMA = false;
   for (const MachineInstr &MI : MBB) {
     if (isBufferLoadLDS(MI)) {
-      std::ofstream log("/tmp/gemmopt_diag.txt", std::ios::app);
-      log << "[GEMMOpt] Async buffer_load→LDS detected, skipping MBB\n";
-      return false;
+      HasAsyncDMA = true;
+      break;
     }
+  }
+  {
+    std::ofstream log("/tmp/gemmopt_diag.txt", std::ios::app);
+    log << "[GEMMOpt] HasAsyncDMA=" << HasAsyncDMA << "\n";
   }
 
   // Step 1: Find GEMM1 chain
   SmallVector<ReadMFMAPair, 32> Chain;
-  if (!findReadMFMAChain(MBB, Chain)) {
+  bool FoundGEMM1 = findReadMFMAChain(MBB, Chain);
+  if (!FoundGEMM1) {
     std::ofstream log("/tmp/gemmopt_diag.txt", std::ios::app);
     log << "[GEMMOpt] findReadMFMAChain FAILED, chain_size=" << Chain.size() << "\n";
-    return false;
+    if (!HasAsyncDMA)
+      return false;
+    return processAsyncDMALoop(MBB);
   }
 
   unsigned N = Chain.size();
@@ -506,14 +690,8 @@ bool SIGEMMScheduleOptimize::processLoop(MachineBasicBlock &MBB) {
   }
 
   // ===== T5: Sink V global loads to just before Barrier1 =====
-  // In the original schedule, V and K global loads are interleaved:
-  //   K1, V1, V2, ds_write(K1), K2, ds_write(K1), ds_write(K2)...
-  // This forces vmcnt to wait for V loads even though their data isn't
-  // needed until after GEMM1.  By sinking V loads to just before
-  // Barrier1, the vmcnt for K ds_writes only counts K loads.  V loads
-  // remain in-flight through the barrier and GEMM1, hiding HBM latency
-  // (gfx942 BackOffBarrier: no vmcnt(0) inserted before S_BARRIER).
-  {
+  // Only for non-async-DMA kernels (old pipeline).
+  if (!HasAsyncDMA) {
     SmallVector<MachineInstr *, 4> VLoadsToSink;
     for (auto II = MBB.begin(), IE = MBB.end(); II != IE; ++II) {
       if (&*II == Barrier1)
@@ -555,10 +733,12 @@ bool SIGEMMScheduleOptimize::processLoop(MachineBasicBlock &MBB) {
   }
 
   VLoadInfo VHi, VLo;
-  bool HasVLoadPattern = findVLoadWritePattern(MBB, Barrier1, Barrier2, VHi, VLo);
+  bool HasVLoadPattern = !HasAsyncDMA &&
+      findVLoadWritePattern(MBB, Barrier1, Barrier2, VHi, VLo);
   {
     std::ofstream log("/tmp/gemmopt_diag.txt", std::ios::app);
-    log << "[GEMMOpt] VLoad pattern: " << HasVLoadPattern << "\n";
+    log << "[GEMMOpt] VLoad pattern: " << HasVLoadPattern
+        << " (AsyncDMA=" << HasAsyncDMA << ")\n";
   }
 
   unsigned DBStart = 0;
@@ -712,6 +892,31 @@ bool SIGEMMScheduleOptimize::run(MachineFunction &MF) {
   const GCNSubtarget &ST = MF.getSubtarget<GCNSubtarget>();
   TII = ST.getInstrInfo();
   TRI = ST.getRegisterInfo();
+
+  // Diagnostic: count SCHED_BARRIER, SCHED_GROUP_BARRIER, MFMAs, ds_reads
+  {
+    unsigned SBCount = 0, SGBCount = 0, MFMACount = 0;
+    unsigned DSReadB128Count = 0, DSRead2B32Count = 0, DSWrite2B32Count = 0;
+    for (MachineBasicBlock &MBB : MF) {
+      for (MachineInstr &MI : MBB) {
+        if (MI.getOpcode() == AMDGPU::SCHED_BARRIER) ++SBCount;
+        if (MI.getOpcode() == AMDGPU::SCHED_GROUP_BARRIER) ++SGBCount;
+        if (SIInstrInfo::isMFMA(MI)) ++MFMACount;
+        if (MI.getOpcode() == AMDGPU::DS_READ_B128 ||
+            MI.getOpcode() == AMDGPU::DS_READ_B128_gfx9) ++DSReadB128Count;
+        if (isDSRead2B32(MI)) ++DSRead2B32Count;
+        if (MI.getOpcode() == AMDGPU::DS_WRITE2_B32 ||
+            MI.getOpcode() == AMDGPU::DS_WRITE2_B32_gfx9) ++DSWrite2B32Count;
+      }
+    }
+    std::ofstream log("/tmp/gemmopt_diag.txt", std::ios::app);
+    log << "[GEMMOpt] Instruction survey: SCHED_BARRIER=" << SBCount
+        << " SCHED_GROUP_BARRIER=" << SGBCount
+        << " MFMA=" << MFMACount
+        << " DS_READ_B128=" << DSReadB128Count
+        << " DS_READ2_B32=" << DSRead2B32Count
+        << " DS_WRITE2_B32=" << DSWrite2B32Count << "\n";
+  }
 
   bool Changed = false;
   for (MachineBasicBlock &MBB : MF) {

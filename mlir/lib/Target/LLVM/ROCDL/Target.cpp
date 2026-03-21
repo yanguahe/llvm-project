@@ -40,6 +40,8 @@
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/TargetParser/TargetParser.h"
 
+#include "llvm/Support/CommandLine.h"
+
 #include <cstdlib>
 #include <optional>
 
@@ -418,6 +420,24 @@ FailureOr<SmallVector<char, 0>> SerializeGPUModuleBase::moduleToObjectImpl(
     return getOperation().emitError()
            << "target Machine unavailable for triple " << triple
            << ", can't compile with LLVM";
+
+  // Apply command-line options from targetOptions to LLVM backend.
+  {
+    StringRef cmdOpts = targetOptions.getCmdOptions();
+    if (!cmdOpts.empty()) {
+      auto tokenized =
+          gpu::TargetOptions::tokenizeCmdOptions(cmdOpts.str());
+      SmallVector<const char *, 16> argv;
+      argv.push_back("mlir-rocdl");
+      for (const char *arg : tokenized.second)
+        argv.push_back(arg);
+      llvm::cl::ResetAllOptionOccurrences();
+      llvm::cl::ParseCommandLineOptions(argv.size(), argv.data(),
+                                        "ROCDL target options\n",
+                                        /*Errs=*/nullptr,
+                                        /*EnvVar=*/nullptr);
+    }
+  }
 
   // Translate the Module to ISA.
   FailureOr<SmallString<0>> serializedISA =
