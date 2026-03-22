@@ -160,6 +160,7 @@ add_llvm_target(AMDGPUCodeGen
   SIFormMemoryClauses.cpp
   SIFrameLowering.cpp
   SIInsertHardClauses.cpp
+  SIGEMMScheduleOptimize.cpp
   SIInsertWaitcnts.cpp
   SIInstrInfo.cpp
   SIISelLowering.cpp

@@ -48,6 +48,7 @@ FunctionPass *createSIOptimizeVGPRLiveRangeLegacyPass();
 FunctionPass *createSIFixSGPRCopiesLegacyPass();
 FunctionPass *createLowerWWMCopiesPass();
 FunctionPass *createSIMemoryLegalizerPass();
+FunctionPass *createSIGEMMScheduleOptimizePass();
 FunctionPass *createSIInsertWaitcntsPass();
 FunctionPass *createSIPreAllocateWWMRegsLegacyPass();
 FunctionPass *createSIFormMemoryClausesLegacyPass();
@@ -223,6 +224,9 @@ extern char &SILowerControlFlowLegacyID;
 
 void initializeSIPreEmitPeepholeLegacyPass(PassRegistry &);
 extern char &SIPreEmitPeepholeID;
+
+void initializeSIGEMMScheduleOptimizeLegacyPass(PassRegistry &);
+extern char &SIGEMMScheduleOptimizeLegacyID;
 
 void initializeSILateBranchLoweringLegacyPass(PassRegistry &);
 extern char &SILateBranchLoweringPassID;

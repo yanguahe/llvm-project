@@ -30,9 +30,34 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Transforms/IPO/Internalize.h"
+#include "llvm/Support/CommandLine.h"
+#include <cstdlib>
+#include <sstream>
 
 using namespace mlir;
 using namespace mlir::LLVM;
+
+static std::once_flag flydslLlvmOptsFlag;
+static void parseFlydslLlvmOpts() {
+  static const char *defaultOpts =
+      "-enable-post-misched=0 --lsr-drop-solution=1";
+  const char *optsEnv = std::getenv("FLYDSL_LLVM_OPTS");
+  const char *optsStr = (optsEnv && optsEnv[0] != '\0') ? optsEnv : defaultOpts;
+
+  std::vector<const char *> args;
+  args.push_back("flydsl-gpu-compiler");
+  std::string optsStrBuf(optsStr);
+  std::istringstream iss(optsStrBuf);
+  std::string tok;
+  static std::vector<std::string> storage;
+  while (iss >> tok) {
+    storage.push_back(tok);
+    args.push_back(storage.back().c_str());
+  }
+  llvm::cl::ResetAllOptionOccurrences();
+  llvm::cl::ParseCommandLineOptions(args.size(), args.data(),
+                                    "FlyDSL LLVM backend options");
+}
 
 ModuleToObject::ModuleToObject(
     Operation &module, StringRef triple, StringRef chip, StringRef features,
@@ -53,6 +78,7 @@ Operation &ModuleToObject::getOperation() { return module; }
 FailureOr<llvm::TargetMachine *> ModuleToObject::getOrCreateTargetMachine() {
   if (targetMachine)
     return targetMachine.get();
+  std::call_once(flydslLlvmOptsFlag, parseFlydslLlvmOpts);
   // Load the target.
   std::string error;
   llvm::Triple parsedTriple(triple);
