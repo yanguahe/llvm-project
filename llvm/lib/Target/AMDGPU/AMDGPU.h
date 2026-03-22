@@ -48,6 +48,7 @@ FunctionPass *createSIOptimizeVGPRLiveRangeLegacyPass();
 FunctionPass *createSIFixSGPRCopiesLegacyPass();
 FunctionPass *createLowerWWMCopiesPass();
 FunctionPass *createSIMemoryLegalizerPass();
+FunctionPass *createSIGEMMScheduleOptimizePass();
 FunctionPass *createSIInsertWaitcntsPass();
 FunctionPass *createSIPreAllocateWWMRegsLegacyPass();
 FunctionPass *createSIFormMemoryClausesLegacyPass();
@@ -223,6 +224,9 @@ extern char &SILowerControlFlowLegacyID;
 
 void initializeSIPreEmitPeepholeLegacyPass(PassRegistry &);
 extern char &SIPreEmitPeepholeID;
+
+void initializeSIGEMMScheduleOptimizeLegacyPass(PassRegistry &);
+extern char &SIGEMMScheduleOptimizeLegacyID;
 
 void initializeSILateBranchLoweringLegacyPass(PassRegistry &);
 extern char &SILateBranchLoweringPassID;
@@ -553,6 +557,15 @@ extern char &GCNPreRAOptimizationsID;
 
 FunctionPass *createAMDGPUSetWavePriorityPass();
 void initializeAMDGPUSetWavePriorityLegacyPass(PassRegistry &);
+
+FunctionPass *createSIInsertWaveGroupPrioPass();
+void initializeSIInsertWaveGroupPrioPass(PassRegistry &);
+
+FunctionPass *createSIScheduleKReadsPass();
+void initializeSIScheduleKReadsPass(PassRegistry &);
+
+FunctionPass *createSIFixSchedBarrierOrderPass();
+void initializeSIFixSchedBarrierOrderLegacyPass(PassRegistry &);
 
 void initializeGCNRewritePartialRegUsesLegacyPass(llvm::PassRegistry &);
 extern char &GCNRewritePartialRegUsesID;

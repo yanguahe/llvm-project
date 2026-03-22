@@ -32,6 +32,8 @@
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/MC/MCSubtargetInfo.h"
 #include "llvm/MC/TargetRegistry.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/FileUtilities.h"
 #include "llvm/Support/Path.h"
@@ -413,6 +415,21 @@ FailureOr<SmallVector<char, 0>> SerializeGPUModuleBase::moduleToObjectImpl(
   if (targetOptions.getCompilationTarget() == gpu::CompilationTarget::Offload)
     return SerializeGPUModuleBase::moduleToObject(llvmModule);
 
+  // Apply cmdOptions as LLVM command-line flags so they reach the AMDGPU
+  // backend's scheduling and waitcnt-insertion passes.
+  {
+    auto cmdOpts = targetOptions.tokenizeCmdOptions();
+    if (!cmdOpts.second.empty()) {
+      SmallVector<const char *, 16> argv;
+      argv.push_back("mlir-rocdl");
+      argv.append(cmdOpts.second.begin(), cmdOpts.second.end());
+      llvm::cl::ResetAllOptionOccurrences();
+      llvm::cl::ParseCommandLineOptions(argv.size(), argv.data(),
+                                        "ROCDL LLVM backend options\n",
+                                        /*Errs=*/nullptr);
+    }
+  }
+
   FailureOr<llvm::TargetMachine *> targetMachine = getOrCreateTargetMachine();
   if (failed(targetMachine))
     return getOperation().emitError()
@@ -442,6 +459,33 @@ FailureOr<SmallVector<char, 0>> SerializeGPUModuleBase::moduleToObjectImpl(
     return getOperation().emitError()
            << "invalid ROCm path, please set a valid path";
 
+  // Post-process ISA if FLYDSL_POSTPROCESS_ISA is set to a script path.
+  if (const char *ppScript = std::getenv("FLYDSL_POSTPROCESS_ISA")) {
+    // Write ISA to temp file, run script, read back.
+    llvm::SmallString<128> inputPath, outputPath;
+    llvm::sys::fs::createTemporaryFile("isa_input", "s", inputPath);
+    llvm::sys::fs::createTemporaryFile("isa_output", "s", outputPath);
+    {
+      std::error_code ec;
+      llvm::raw_fd_ostream os(inputPath, ec);
+      if (!ec)
+        os << *serializedISA;
+    }
+    std::string cmd = std::string(ppScript) + " " + inputPath.c_str() + " " +
+                      outputPath.c_str();
+    int ret = std::system(cmd.c_str());
+    if (ret == 0) {
+      auto buf = llvm::MemoryBuffer::getFile(outputPath);
+      if (buf) {
+        serializedISA->clear();
+        serializedISA->append((*buf)->getBufferStart(),
+                              (*buf)->getBufferEnd());
+      }
+    }
+    llvm::sys::fs::remove(inputPath);
+    llvm::sys::fs::remove(outputPath);
+  }
+
   // Compile to binary.
   return compileToBinary(*serializedISA);
 }
@@ -456,7 +500,11 @@ public:
   FailureOr<SmallVector<char, 0>>
   moduleToObject(llvm::Module &llvmModule) override;
 
+  LogicalResult optimizeModule(llvm::Module &module, int optL) override;
+
 private:
+  void applyCmdOptions();
+
   // Target options.
   gpu::TargetOptions targetOptions;
 };
@@ -466,6 +514,25 @@ AMDGPUSerializer::AMDGPUSerializer(Operation &module, ROCDLTargetAttr target,
                                    const gpu::TargetOptions &targetOptions)
     : SerializeGPUModuleBase(module, target, targetOptions),
       targetOptions(targetOptions) {}
+
+void AMDGPUSerializer::applyCmdOptions() {
+  auto cmdOpts = targetOptions.tokenizeCmdOptions();
+  if (!cmdOpts.second.empty()) {
+    SmallVector<const char *, 16> argv;
+    argv.push_back("mlir-rocdl");
+    argv.append(cmdOpts.second.begin(), cmdOpts.second.end());
+    llvm::cl::ResetAllOptionOccurrences();
+    llvm::cl::ParseCommandLineOptions(argv.size(), argv.data(),
+                                      "ROCDL LLVM backend options\n",
+                                      /*Errs=*/nullptr);
+  }
+}
+
+LogicalResult AMDGPUSerializer::optimizeModule(llvm::Module &module,
+                                               int optL) {
+  applyCmdOptions();
+  return SerializeGPUModuleBase::optimizeModule(module, optL);
+}
 
 FailureOr<SmallVector<char, 0>>
 AMDGPUSerializer::moduleToObject(llvm::Module &llvmModule) {

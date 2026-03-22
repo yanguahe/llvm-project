@@ -3137,6 +3137,7 @@ def int_amdgcn_ds_read_tr4_b64     : AMDGPULoadIntrinsic<local_ptr_ty>;
 def int_amdgcn_ds_read_tr6_b96     : AMDGPULoadIntrinsic<local_ptr_ty>;
 def int_amdgcn_ds_read_tr8_b64     : AMDGPULoadIntrinsic<local_ptr_ty>;
 def int_amdgcn_ds_read_tr16_b64    : AMDGPULoadIntrinsic<local_ptr_ty>;
+def int_amdgcn_ds_read_b128        : AMDGPULoadIntrinsic<local_ptr_ty>;
 
 // i32 @llvm.amdgcn.wave.id()
 def int_amdgcn_wave_id :
@@ -3476,6 +3477,22 @@ def int_amdgcn_mfma_f32_16x16x4bf16_1k  : AMDGPUMfmaIntrinsic<llvm_v16f32_ty, ll
 def int_amdgcn_mfma_f32_4x4x4bf16_1k    : AMDGPUMfmaIntrinsic<llvm_v4f32_ty,  llvm_v4i16_ty>;
 def int_amdgcn_mfma_f32_32x32x8bf16_1k  : AMDGPUMfmaIntrinsic<llvm_v16f32_ty, llvm_v4i16_ty>;
 def int_amdgcn_mfma_f32_16x16x16bf16_1k : AMDGPUMfmaIntrinsic<llvm_v4f32_ty,  llvm_v4i16_ty>;
+
+// Explicit register class control variants: force D/C to VGPR (ACC_CD=0).
+// These bypass the mayNeedAGPRs() heuristic and always select the _vgprcd_e64
+// pseudo instruction, giving users deterministic register class assignment.
+def int_amdgcn_mfma_f32_16x16x16bf16_1k_vcd : AMDGPUMfmaIntrinsic<llvm_v4f32_ty, llvm_v4i16_ty>;
+
+// Force a value into AccVGPR (AGPR) register class.
+// Identity function at the value level; the only effect is constraining the
+// register allocator to place the result in AGPR. Useful for forcing K data
+// into AccVGPR before feeding to MFMA A operand (ACC[0]=1 encoding).
+def int_amdgcn_to_agpr_v4i32 :
+  DefaultAttrsIntrinsic<[llvm_v4i32_ty], [llvm_v4i32_ty],
+                        [IntrNoMem, IntrConvergent]>;
+def int_amdgcn_to_agpr_v4i16 :
+  DefaultAttrsIntrinsic<[llvm_v4i16_ty], [llvm_v4i16_ty],
+                        [IntrNoMem, IntrConvergent]>;
 
 // Note: in gfx942 BLGP argument is replaced by NEG bitfield in the DGEMM MFMA.
 //       Three bits corresponding to the neg modifier applied to the respective

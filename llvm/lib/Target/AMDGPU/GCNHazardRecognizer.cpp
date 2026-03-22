@@ -18,7 +18,10 @@
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/ScheduleDAG.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/TargetParser/TargetParser.h"
+
+#define DEBUG_TYPE "gcn-hazard-rec"
 
 using namespace llvm;
 
@@ -297,10 +300,84 @@ void GCNHazardRecognizer::processBundle() {
   CurrCycleInstr = nullptr;
 }
 
+static bool canMoveBeforeHazardPoint(const MachineInstr &Cand,
+                                     const MachineInstr &HazardMI,
+                                     const SIRegisterInfo &TRI) {
+  if (Cand.isTerminator() || Cand.isBranch() || Cand.isCall() ||
+      Cand.isLabel() || Cand.isBundle() || Cand.isInlineAsm() ||
+      Cand.isDebugInstr() || Cand.hasUnmodeledSideEffects() ||
+      Cand.getOpcode() == AMDGPU::SCHED_BARRIER ||
+      Cand.getOpcode() == AMDGPU::SCHED_GROUP_BARRIER ||
+      Cand.getOpcode() == AMDGPU::S_WAITCNT ||
+      Cand.getOpcode() == AMDGPU::S_WAITCNT_VSCNT ||
+      Cand.getOpcode() == AMDGPU::S_BARRIER)
+    return false;
+
+  if (SIInstrInfo::isMFMA(Cand) || SIInstrInfo::isEXP(Cand))
+    return false;
+
+  // Allow DS reads and VMEM loads to fill MFMA→VALU hazard gaps;
+  // block DS writes, VMEM stores, and atomics.
+  if (SIInstrInfo::isDS(Cand) && (Cand.mayStore() || !Cand.mayLoad()))
+    return false;
+  if (SIInstrInfo::isVMEM(Cand) && (Cand.mayStore() || !Cand.mayLoad()))
+    return false;
+
+  for (const MachineOperand &Op : Cand.operands()) {
+    if (!Op.isReg() || !Op.getReg())
+      continue;
+    Register Reg = Op.getReg();
+    if (Op.isDef()) {
+      for (const MachineOperand &HUse : HazardMI.operands()) {
+        if (!HUse.isReg() || !HUse.getReg())
+          continue;
+        if (TRI.regsOverlap(Reg, HUse.getReg()))
+          return false;
+      }
+    }
+    if (Op.isUse()) {
+      for (const MachineOperand &HDef : HazardMI.defs()) {
+        if (!HDef.isReg() || !HDef.getReg())
+          continue;
+        if (TRI.regsOverlap(Reg, HDef.getReg()))
+          return false;
+      }
+    }
+  }
+  return true;
+}
+
+static bool hasRegConflict(const MachineInstr &A, const MachineInstr &B,
+                           const SIRegisterInfo &TRI) {
+  for (const MachineOperand &OpA : A.operands()) {
+    if (!OpA.isReg() || !OpA.getReg())
+      continue;
+    for (const MachineOperand &OpB : B.operands()) {
+      if (!OpB.isReg() || !OpB.getReg())
+        continue;
+      if (!TRI.regsOverlap(OpA.getReg(), OpB.getReg()))
+        continue;
+      if (OpA.isDef() || OpB.isDef())
+        return true;
+    }
+  }
+  return false;
+}
+
 void GCNHazardRecognizer::runOnInstruction(MachineInstr *MI) {
   assert(IsHazardRecognizerMode);
 
   unsigned NumPreNoops = PreEmitNoops(MI);
+
+  if (NumPreNoops >= 1 && !MI->isInsideBundle()) {
+    unsigned Before = NumPreNoops;
+    NumPreNoops = fillHazardGap(MI, NumPreNoops);
+    if (NumPreNoops < Before) {
+      LLVM_DEBUG(dbgs() << "GCNHazardFiller: filled " << (Before - NumPreNoops)
+                        << " of " << Before << " NOPs before: " << *MI);
+    }
+  }
+
   EmitNoops(NumPreNoops);
   if (MI->isInsideBundle())
     insertNoopsInBundle(MI, TII, NumPreNoops);
@@ -311,13 +388,94 @@ void GCNHazardRecognizer::runOnInstruction(MachineInstr *MI) {
   AdvanceCycle();
 }
 
+unsigned GCNHazardRecognizer::fillHazardGap(MachineInstr *MI,
+                                            unsigned NumNoops) {
+  MachineBasicBlock *MBB = MI->getParent();
+  MachineBasicBlock::iterator InsertPt(MI);
+  auto It = std::next(MachineBasicBlock::iterator(MI));
+  unsigned Filled = 0;
+
+  SmallVector<MachineInstr *, 16> ToMove;
+  SmallVector<MachineInstr *, 16> Skipped;
+
+  unsigned ScanLimit = 200;
+  unsigned Scanned = 0;
+  while (It != MBB->end() && Filled < NumNoops && Scanned < ScanLimit) {
+    MachineInstr &Cand = *It;
+    auto Next = std::next(It);
+    ++Scanned;
+
+    if (Cand.isTerminator() || Cand.isBranch() || Cand.isLabel() ||
+        Cand.isBundle() || Cand.isInlineAsm() ||
+        Cand.getOpcode() == AMDGPU::S_BARRIER)
+      break;
+
+    if (!canMoveBeforeHazardPoint(Cand, *MI, TRI)) {
+      Skipped.push_back(&Cand);
+      It = Next;
+      continue;
+    }
+
+    bool Blocked = false;
+    for (MachineInstr *S : Skipped) {
+      if (hasRegConflict(Cand, *S, TRI)) {
+        Blocked = true;
+        break;
+      }
+    }
+    if (!Blocked) {
+      for (MachineInstr *M : ToMove) {
+        if (hasRegConflict(Cand, *M, TRI)) {
+          Blocked = true;
+          break;
+        }
+      }
+    }
+
+    if (!Blocked) {
+      CurrCycleInstr = &Cand;
+      unsigned CandNoops = PreEmitNoopsCommon(&Cand);
+      CurrCycleInstr = nullptr;
+      if (CandNoops > 0)
+        Blocked = true;
+    }
+
+    if (Blocked) {
+      Skipped.push_back(&Cand);
+    } else {
+      ToMove.push_back(&Cand);
+      Filled++;
+    }
+    It = Next;
+  }
+
+  for (MachineInstr *Inst : ToMove) {
+    Inst->removeFromParent();
+    MBB->insert(InsertPt, Inst);
+    EmitInstruction(Inst);
+    AdvanceCycle();
+  }
+
+  return NumNoops > Filled ? NumNoops - Filled : 0;
+}
+
 unsigned GCNHazardRecognizer::PreEmitNoops(MachineInstr *MI) {
   IsHazardRecognizerMode = true;
   CurrCycleInstr = MI;
   unsigned W = PreEmitNoopsCommon(MI);
   fixHazards(MI);
   CurrCycleInstr = nullptr;
-  return std::max(W, NopPadding.getValue());
+
+  unsigned Result = std::max(W, NopPadding.getValue());
+  if (Result >= 1 && MI->getParent() && !MI->isInsideBundle()) {
+    unsigned Before = Result;
+    Result = fillHazardGap(MI, Result);
+    LLVM_DEBUG(if (Result < Before) {
+      dbgs() << "GCNHazardFiller: filled " << (Before - Result)
+             << " of " << Before << " NOPs before: " << *MI;
+    });
+  }
+  return Result;
 }
 
 unsigned GCNHazardRecognizer::PreEmitNoopsCommon(MachineInstr *MI) {

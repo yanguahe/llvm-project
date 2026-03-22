@@ -113,6 +113,9 @@ add_llvm_target(AMDGPUCodeGen
   AMDGPUSelectionDAGInfo.cpp
   AMDGPUSetWavePriority.cpp
   AMDGPUSplitModule.cpp
+  SIInsertWaveGroupPrio.cpp
+  SIScheduleKReads.cpp
+  SIFixSchedBarrierOrder.cpp
   AMDGPUSubtarget.cpp
   AMDGPUTargetMachine.cpp
   AMDGPUTargetObjectFile.cpp
@@ -160,6 +163,7 @@ add_llvm_target(AMDGPUCodeGen
   SIFormMemoryClauses.cpp
   SIFrameLowering.cpp
   SIInsertHardClauses.cpp
+  SIGEMMScheduleOptimize.cpp
   SIInsertWaitcnts.cpp
   SIInstrInfo.cpp
   SIISelLowering.cpp

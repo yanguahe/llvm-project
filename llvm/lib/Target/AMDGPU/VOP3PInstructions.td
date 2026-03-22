@@ -1192,6 +1192,33 @@ let SubtargetPredicate = isGFX90APlus in {
   }
 } // End SubtargetPredicate = isGFX90APlus
 
+// Explicit register class control: _vcd variant forces D/C to VGPR (ACC_CD=0).
+// Maps int_amdgcn_mfma_f32_16x16x16bf16_1k_vcd directly to the _vgprcd_e64
+// pseudo, bypassing the mayNeedAGPRs() heuristic.
+let SubtargetPredicate = isGFX90APlus in {
+  def : GCNPat<
+    (v4f32 (int_amdgcn_mfma_f32_16x16x16bf16_1k_vcd
+            v4i16:$src0, v4i16:$src1, v4f32:$src2,
+            (i32 timm:$cbsz), (i32 timm:$abid), (i32 timm:$blgp))),
+    (V_MFMA_F32_16X16X16BF16_1K_vgprcd_e64
+     $src0, $src1, $src2, $cbsz, $abid, $blgp)
+  >;
+}
+
+// Force value into AccVGPR register class (identity at value level).
+// COPY_TO_REGCLASS constrains register allocation without emitting instructions
+// when the source is already in a compatible class (e.g., AVLdSt includes AGPR).
+let SubtargetPredicate = isGFX90APlus in {
+  def : GCNPat<
+    (v4i32 (int_amdgcn_to_agpr_v4i32 v4i32:$src)),
+    (COPY_TO_REGCLASS $src, AReg_128)
+  >;
+  def : GCNPat<
+    (v4i16 (int_amdgcn_to_agpr_v4i16 v4i16:$src)),
+    (COPY_TO_REGCLASS $src, AReg_64)
+  >;
+}
+
 let SubtargetPredicate = isGFX940Plus, is_gfx940_xdl = 1 in {
   defm V_MFMA_I32_32X32X16I8       : MAIInst<"v_mfma_i32_32x32x16i8",       "I32_I64_X32",    int_amdgcn_mfma_i32_32x32x16_i8>;
   defm V_MFMA_I32_16X16X32I8       : MAIInst<"v_mfma_i32_16x16x32i8",       "I32_I64_X16",    int_amdgcn_mfma_i32_16x16x32_i8>;

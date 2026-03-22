@@ -4457,7 +4457,12 @@ bool SIInstrInfo::isSchedulingBoundary(const MachineInstr &MI,
   if (MI.getOpcode() == TargetOpcode::INLINEASM_BR)
     return true;
 
-  if (MI.getOpcode() == AMDGPU::SCHED_BARRIER && MI.getOperand(0).getImm() == 0)
+  // Inline ASM with side effects is a hard scheduling boundary.
+  if (MI.isInlineAsm() && MI.hasUnmodeledSideEffects())
+    return true;
+
+  if (MI.getOpcode() == AMDGPU::SCHED_BARRIER ||
+      MI.getOpcode() == AMDGPU::SCHED_GROUP_BARRIER)
     return true;
 
   // Target-independent instructions do not have an implicit-use of EXEC, even

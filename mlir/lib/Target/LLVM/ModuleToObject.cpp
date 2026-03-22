@@ -29,7 +29,10 @@
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
+#include "llvm/Target/TargetOptions.h"
 #include "llvm/Transforms/IPO/Internalize.h"
+
+#include <cstdlib>
 
 using namespace mlir;
 using namespace mlir::LLVM;
@@ -63,8 +66,13 @@ FailureOr<llvm::TargetMachine *> ModuleToObject::getOrCreateTargetMachine() {
            << "Failed to lookup target for triple '" << triple << "' " << error;
 
   // Create the target machine using the target.
-  targetMachine.reset(
-      target->createTargetMachine(parsedTriple, chip, features, {}, {}));
+  llvm::TargetOptions Options;
+  if (const char *env = std::getenv("MLIR_ASM_VERBOSE")) {
+    Options.MCOptions.AsmVerbose = (std::string(env) == "1");
+  }
+
+  targetMachine.reset(target->createTargetMachine(parsedTriple, chip, features,
+                                                  Options, {}));
   if (!targetMachine)
     return getOperation().emitError()
            << "Failed to create target machine for triple '" << triple << "'";

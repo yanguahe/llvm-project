@@ -58,10 +58,29 @@ static cl::opt<bool>
                                "s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)"),
                       cl::init(false), cl::Hidden);
 
+static cl::opt<bool>
+    SkipLDSDMAVmcnt("amdgpu-skip-lds-dma-vmcnt",
+                    cl::desc("Skip vmcnt wait for LDS DMA (buffer_load_lds) "
+                             "before DS operations when alias info is absent"),
+                    cl::init(false), cl::Hidden);
+
 static cl::opt<bool> ForceEmitZeroLoadFlag(
     "amdgpu-waitcnt-load-forcezero",
     cl::desc("Force all waitcnt load counters to wait until 0"),
     cl::init(false), cl::Hidden);
+
+static cl::opt<bool> CoalesceDsWaitcnt(
+    "amdgpu-coalesce-ds-waitcnt",
+    cl::desc("Coalesce DS_CNT ladder waits: when a non-zero DS_CNT wait is "
+             "needed, force it to 0 so subsequent consumers see all reads as "
+             "complete, eliminating per-pair lgkmcnt instructions"),
+    cl::init(false), cl::Hidden);
+
+static cl::opt<bool> TrustBarrierWaitcnt(
+    "amdgpu-trust-barrier-waitcnt",
+    cl::desc("Trust explicit S_WAITCNT before S_BARRIER instead of forcing "
+             "all counters to zero. Use when user code places targeted waits."),
+    cl::init(true), cl::Hidden);
 
 static cl::opt<bool> ExpertSchedulingModeFlag(
     "amdgpu-expert-scheduling-mode",
@@ -2430,7 +2449,7 @@ bool SIInsertWaitcnts::generateWaitcntInstBefore(
   // In all other cases, ensure safety by ensuring that there are no outstanding
   // memory operations.
   if (Opc == AMDGPU::S_BARRIER && !ST->hasAutoWaitcntBeforeBarrier() &&
-      !ST->hasBackOffBarrier()) {
+      !ST->hasBackOffBarrier() && !TrustBarrierWaitcnt) {
     Wait = Wait.combined(WCG->getAllZeroWaitcnt(/*IncludeVSCnt=*/true));
   }
 
@@ -2444,6 +2463,12 @@ bool SIInsertWaitcnts::generateWaitcntInstBefore(
 
   // Verify that the wait is actually needed.
   ScoreBrackets.simplifyWaitcnt(Wait);
+
+  // Coalesce DS ladder waits: force any non-zero DS_CNT wait to 0 so that
+  // subsequent consumers in an MFMA chain see all reads as already complete,
+  // eliminating per-pair lgkmcnt(N), lgkmcnt(N-1), ... sequences.
+  if (CoalesceDsWaitcnt && Wait.DsCnt != ~0u && Wait.DsCnt > 0)
+    Wait.DsCnt = 0;
 
   // It is only necessary to insert an S_WAITCNT_DEPCTR instruction that
   // waits on VA_VDST if the instruction it would precede is not a VALU

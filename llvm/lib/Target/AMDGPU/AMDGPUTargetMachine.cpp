@@ -49,6 +49,8 @@
 #include "R600TargetMachine.h"
 #include "SIFixSGPRCopies.h"
 #include "SIFixVGPRCopies.h"
+#include "SIFixSchedBarrierOrder.h"
+#include "SIInstrInfo.h"
 #include "SIFoldOperands.h"
 #include "SIFormMemoryClauses.h"
 #include "SILoadStoreOptimizer.h"
@@ -609,6 +611,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAMDGPUTarget() {
   initializeSIWholeQuadModeLegacyPass(*PR);
   initializeSILowerControlFlowLegacyPass(*PR);
   initializeSIPreEmitPeepholeLegacyPass(*PR);
+  initializeSIGEMMScheduleOptimizeLegacyPass(*PR);
   initializeSILateBranchLoweringLegacyPass(*PR);
   initializeSIMemoryLegalizerLegacyPass(*PR);
   initializeSIOptimizeExecMaskingLegacyPass(*PR);
@@ -630,6 +633,9 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAMDGPUTarget() {
   initializeAMDGPUPreloadKernArgPrologLegacyPass(*PR);
   initializeAMDGPUWaitSGPRHazardsLegacyPass(*PR);
   initializeAMDGPUPreloadKernelArgumentsLegacyPass(*PR);
+  initializeSIInsertWaveGroupPrioPass(*PR);
+  initializeSIScheduleKReadsPass(*PR);
+  initializeSIFixSchedBarrierOrderLegacyPass(*PR);
   initializeAMDGPUUniformIntrinsicCombineLegacyPass(*PR);
 }
 
@@ -1200,6 +1206,76 @@ GCNTargetMachine::createMachineScheduler(MachineSchedContext *C) const {
   return createGCNMaxOccupancyMachineScheduler(C);
 }
 
+static cl::opt<bool> SeparateMFMAVALU(
+    "amdgpu-separate-mfma-valu", cl::Hidden,
+    cl::desc("Add post-RA DAG edges to batch MFMA away from VALU on MI308X"),
+    cl::init(false));
+
+namespace {
+
+class SeparateMFMAVALUMutation : public ScheduleDAGMutation {
+public:
+  void apply(ScheduleDAGInstrs *DAG) override {
+    const unsigned NumSUnits = DAG->SUnits.size();
+    if (NumSUnits == 0)
+      return;
+
+    SmallVector<SUnit *, 32> MFMAs;
+    SmallVector<SUnit *, 64> VALUs;
+
+    for (SUnit &SU : DAG->SUnits) {
+      if (!SU.getInstr())
+        continue;
+      if (SIInstrInfo::isMFMA(*SU.getInstr()))
+        MFMAs.push_back(&SU);
+      else if (SIInstrInfo::isVALU(*SU.getInstr()))
+        VALUs.push_back(&SU);
+    }
+
+    if (MFMAs.empty() || VALUs.empty())
+      return;
+
+    BitVector Reachable(NumSUnits);
+
+    std::function<void(SUnit *)> CollectSuccs = [&](SUnit *SU) {
+      for (const SDep &Succ : SU->Succs) {
+        SUnit *S = Succ.getSUnit();
+        if (S && S->NodeNum < NumSUnits && !Reachable.test(S->NodeNum)) {
+          Reachable.set(S->NodeNum);
+          CollectSuccs(S);
+        }
+      }
+    };
+
+    for (SUnit *MFMA : MFMAs) {
+      Reachable.reset();
+      Reachable.set(MFMA->NodeNum);
+      CollectSuccs(MFMA);
+
+      for (SUnit *VALU : VALUs) {
+        if (Reachable.test(VALU->NodeNum))
+          continue;
+
+        bool AlreadyPred = false;
+        for (const SDep &Pred : MFMA->Preds) {
+          if (Pred.getSUnit() == VALU) {
+            AlreadyPred = true;
+            break;
+          }
+        }
+        if (AlreadyPred)
+          continue;
+
+        SDep Dep(VALU, SDep::Artificial);
+        Dep.setLatency(0);
+        MFMA->addPred(Dep);
+      }
+    }
+  }
+};
+
+} // anonymous namespace
+
 ScheduleDAGInstrs *
 GCNTargetMachine::createPostMachineScheduler(MachineSchedContext *C) const {
   ScheduleDAGMI *DAG =
@@ -1215,6 +1291,8 @@ GCNTargetMachine::createPostMachineScheduler(MachineSchedContext *C) const {
       EnableVOPD)
     DAG->addMutation(createVOPDPairingMutation());
   DAG->addMutation(createAMDGPUExportClusteringDAGMutation());
+  if (SeparateMFMAVALU)
+    DAG->addMutation(std::make_unique<SeparateMFMAVALUMutation>());
   DAG->addMutation(createAMDGPUBarrierLatencyDAGMutation(C->MF));
   return DAG;
 }
@@ -1779,6 +1857,8 @@ void GCNPassConfig::addPreEmitPass() {
   if (isPassEnabled(EnableVOPD, CodeGenOptLevel::Less))
     addPass(&GCNCreateVOPDID);
   addPass(createSIMemoryLegalizerPass());
+  addPass(createSIGEMMScheduleOptimizePass());
+  addPass(createSIScheduleKReadsPass());
   addPass(createSIInsertWaitcntsPass());
 
   addPass(createSIModeRegisterPass());
@@ -1807,6 +1887,10 @@ void GCNPassConfig::addPreEmitPass() {
 
   if (isPassEnabled(EnableInsertDelayAlu, CodeGenOptLevel::Less))
     addPass(&AMDGPUInsertDelayAluID);
+
+  addPass(createSIFixSchedBarrierOrderPass());
+
+  addPass(createSIInsertWaveGroupPrioPass());
 
   addPass(&BranchRelaxationPassID);
 }
@@ -2460,6 +2544,7 @@ void AMDGPUCodeGenPassBuilder::addPreEmitPass(PassManagerWrapper &PMW) const {
   }
 
   addMachineFunctionPass(SIMemoryLegalizerPass(), PMW);
+  // SIGEMMScheduleOptimize is legacy-only; NPM version not yet implemented.
   addMachineFunctionPass(SIInsertWaitcntsPass(), PMW);
 
   addMachineFunctionPass(SIModeRegisterPass(), PMW);
@@ -2490,6 +2575,8 @@ void AMDGPUCodeGenPassBuilder::addPreEmitPass(PassManagerWrapper &PMW) const {
   if (isPassEnabled(EnableInsertDelayAlu, CodeGenOptLevel::Less)) {
     addMachineFunctionPass(AMDGPUInsertDelayAluPass(), PMW);
   }
+
+  addMachineFunctionPass(SIFixSchedBarrierOrderPass(), PMW);
 
   addMachineFunctionPass(BranchRelaxationPass(), PMW);
 }

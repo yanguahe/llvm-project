@@ -47,6 +47,16 @@ static cl::opt<bool> UseAA("amdgpu-use-aa-in-codegen",
                            cl::desc("Enable the use of AA during codegen."),
                            cl::init(true));
 
+static cl::opt<unsigned> MFMASchedLatency(
+    "amdgpu-mfma-sched-latency",
+    cl::desc("Override MFMA→MFMA same-acc scheduling latency (0 = no override)"),
+    cl::init(0), cl::Hidden);
+
+static cl::opt<unsigned> MFMAVALUSchedLatency(
+    "amdgpu-mfma-valu-sched-latency",
+    cl::desc("Override MFMA→VALU scheduling latency (0 = use mfma-sched-latency)"),
+    cl::init(0), cl::Hidden);
+
 static cl::opt<unsigned>
     NSAThreshold("amdgpu-nsa-threshold",
                  cl::desc("Number of addresses from which to enable MIMG NSA."),
@@ -673,6 +683,21 @@ void GCNSubtarget::adjustSchedDependency(
     // pseudo operands.
     Dep.setLatency(InstrInfo.getSchedModel().computeOperandLatency(
         DefI, DefOpIdx, UseI, UseOpIdx));
+  }
+
+  if (SIInstrInfo::isMFMA(*DefI)) {
+    unsigned MFMALat = MFMASchedLatency;
+    unsigned VALULat = MFMAVALUSchedLatency > 0
+                           ? (unsigned)MFMAVALUSchedLatency
+                           : MFMALat;
+    if (MFMALat > 0 && SIInstrInfo::isMFMA(*UseI)) {
+      int SrcCIdx = AMDGPU::getNamedOperandIdx(UseI->getOpcode(),
+                                                AMDGPU::OpName::src2);
+      if (SrcCIdx >= 0 && UseOpIdx == SrcCIdx)
+        Dep.setLatency(std::max(Dep.getLatency(), MFMALat));
+    }
+    if (VALULat > 0 && InstrInfo.isVALU(*UseI) && !SIInstrInfo::isMFMA(*UseI))
+      Dep.setLatency(std::max(Dep.getLatency(), VALULat));
   }
 }
 

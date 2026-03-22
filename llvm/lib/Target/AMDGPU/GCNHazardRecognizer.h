@@ -145,6 +145,8 @@ private:
   int checkMAILdStHazards(MachineInstr *MI);
   int checkPermlaneHazards(MachineInstr *MI);
 
+  unsigned fillHazardGap(MachineInstr *MI, unsigned NumNoops);
+
 public:
   GCNHazardRecognizer(const MachineFunction &MF);
   // We can only issue one instruction per cycle.
