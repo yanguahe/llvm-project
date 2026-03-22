@@ -68,6 +68,12 @@ static cl::opt<bool> ExpertSchedulingModeFlag(
     cl::desc("Enable expert scheduling mode 2 for all functions (GFX12+ only)"),
     cl::init(false), cl::Hidden);
 
+static cl::opt<unsigned> MFMAChainDsCntConsolidate(
+    "amdgpu-mfma-chain-ds-consolidate",
+    cl::desc("Consolidate DS_CNT waits for MFMA accumulation chains of at "
+             "least this length (0 = disabled)"),
+    cl::init(8), cl::Hidden);
+
 namespace {
 // Class of object that encapsulates latest instruction counter score
 // associated with the operand.  Used for determining whether
@@ -2415,6 +2421,59 @@ bool SIInsertWaitcnts::generateWaitcntInstBefore(
           ScoreBrackets.determineWaitForPhysReg(X_CNT, Reg, Wait);
       }
     }
+  }
+
+  // Consolidate DS_CNT waits for MFMA accumulation chains.
+  // When an MFMA starts a chain of consecutive accumulations into the same
+  // register set, hoist all DS_CNT requirements to the chain head so
+  // SIInsertWaitcnts produces one lgkmcnt before the chain instead of
+  // individual lgkmcnt between each pair.
+  if (MFMAChainDsCntConsolidate > 0 && SIInstrInfo::isMFMA(MI)) {
+    Register DstReg = MI.getOperand(0).getReg();
+    unsigned ChainLen = 1;
+    AMDGPU::Waitcnt ChainWait;
+
+    auto NextIt = std::next(MI.getIterator());
+    auto EndIt = MI.getParent()->end();
+    while (NextIt != EndIt) {
+      if (NextIt->isMetaInstruction() ||
+          NextIt->getOpcode() == AMDGPU::S_NOP ||
+          NextIt->getOpcode() == AMDGPU::S_WAITCNT ||
+          NextIt->getOpcode() == AMDGPU::S_WAITCNT_soft ||
+          NextIt->getOpcode() == AMDGPU::SCHED_BARRIER) {
+        ++NextIt;
+        continue;
+      }
+      if (!SIInstrInfo::isMFMA(*NextIt))
+        break;
+      if (NextIt->getOperand(0).getReg() != DstReg)
+        break;
+      if (!NextIt->getOperand(3).isReg() ||
+          NextIt->getOperand(3).getReg() != DstReg)
+        break;
+
+      ++ChainLen;
+
+      for (const MachineOperand &ChOp : NextIt->operands()) {
+        if (!ChOp.isReg() || !ChOp.isUse())
+          continue;
+        MCPhysReg ChReg = ChOp.getReg().asMCReg();
+        if (!TRI->isVectorRegister(*MRI, ChOp.getReg()))
+          continue;
+        if (ChOp.isImplicit())
+          continue;
+        // Skip the accumulator read (SrcC = DstReg) since it is produced
+        // by the preceding MFMA, not by a ds_read.
+        if (TRI->regsOverlap(ChReg, DstReg.asMCReg()))
+          continue;
+        ScoreBrackets.determineWaitForPhysReg(DS_CNT, ChReg, ChainWait);
+      }
+
+      ++NextIt;
+    }
+
+    if (ChainLen >= MFMAChainDsCntConsolidate)
+      addWait(Wait, DS_CNT, ChainWait.DsCnt);
   }
 
   // Ensure safety against exceptions from outstanding memory operations while

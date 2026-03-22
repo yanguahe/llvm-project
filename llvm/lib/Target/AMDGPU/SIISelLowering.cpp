@@ -7909,6 +7909,16 @@ SDValue SITargetLowering::lowerFMINNUM_FMAXNUM(SDValue Op,
   const SIMachineFunctionInfo *Info = MF.getInfo<SIMachineFunctionInfo>();
   bool IsIEEEMode = Info->getMode().IEEE;
 
+  // With nnan, inputs are guaranteed non-NaN. Convert to IEEE variant
+  // which maps directly to V_MAX_F32/V_MIN_F32 without NaN-checking wrapper.
+  if (Op->getFlags().hasNoNaNs() && !VT.isVector()) {
+    unsigned NewOpc = (Op.getOpcode() == ISD::FMAXNUM)
+                          ? ISD::FMAXNUM_IEEE
+                          : ISD::FMINNUM_IEEE;
+    return DAG.getNode(NewOpc, SDLoc(Op), VT,
+                       Op.getOperand(0), Op.getOperand(1), Op->getFlags());
+  }
+
   // FIXME: Assert during selection that this is only selected for
   // ieee_mode. Currently a combine can produce the ieee version for non-ieee
   // mode functions, but this happens to be OK since it's only done in cases
