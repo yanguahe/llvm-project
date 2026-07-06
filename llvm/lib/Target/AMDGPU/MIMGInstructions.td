@@ -2099,17 +2099,22 @@ class VIMAGE_TENSOR_Real <bits<8> op, VIMAGE_TENSOR_Pseudo ps, string opName = p
   let vaddr2 = !if(ps.UpTo2D, !cast<int>(SGPR_NULL_gfx11plus.HWEncoding), ?);
   let vaddr3 = !if(ps.UpTo2D, !cast<int>(SGPR_NULL_gfx11plus.HWEncoding), ?);
 
-  // Set VADDR4 to NULL
-  let vaddr4 = !cast<int>(SGPR_NULL_gfx11plus.HWEncoding);
-
   // set to 0 based on SPG.
   let rsrc = 0;
   let vdata = 0;
   let d16 = 0;
   let a16 = 0;
   let tfe = 0;
-  let dmask = 1; // sp3
-  let dim = 1;   // sp3
+
+  // dim/dmask/vaddr4 are unused by tensor ops (addressed via the D#
+  // descriptor in SGPRs; use no VGPRs and are not per-lane). Override their
+  // encoding bits to '?' so the disassembler treats them as don't-care and
+  // the encoder emits 0 -- matching the encoding produced by hardware/aiter,
+  // which sets these fields to 0 rather than the sp3 defaults (dim/dmask=1,
+  // vaddr4=NULL).
+  let Inst{2-0}   = ?;  // dim
+  let Inst{25-22} = ?;  // dmask
+  let Inst{63-56} = ?;  // vaddr4
 }
 
 multiclass VIMAGE_TENSOR_Real_gfx1250<bits<8> op> {
